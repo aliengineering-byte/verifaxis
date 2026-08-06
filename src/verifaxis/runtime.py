@@ -16,7 +16,9 @@ from .types import (
     LoopStep,
     RunTrace,
     TerminationReason,
+    Usage,
     VerificationResult,
+    canonical_json,
 )
 
 
@@ -36,6 +38,7 @@ def _remaining_budget(
     iterations: int,
     model_calls: int,
     verifier_calls: int,
+    total_tokens: int,
 ) -> dict[str, JSONValue]:
     verifier_remaining = (
         None
@@ -47,6 +50,11 @@ def _remaining_budget(
         "model_calls": max(0, budget.model_call_limit - model_calls),
         "verifier_calls": verifier_remaining,
         "wall_time_seconds": budget.max_wall_time_seconds,
+        "total_tokens": (
+            None
+            if budget.max_total_tokens is None
+            else max(0, budget.max_total_tokens - total_tokens)
+        ),
     }
 
 
@@ -69,6 +77,7 @@ def _state_for_model(
             iterations=len(trace.steps),
             model_calls=trace.model_calls,
             verifier_calls=trace.verifier_calls,
+            total_tokens=trace.total_tokens,
         ),
     }
 
@@ -88,7 +97,11 @@ def _finalize(
     trace.finish(reason, perf_counter() - started)
     candidate = trace.final_candidate
     return VerificationResult(
-        answer="" if candidate is None else candidate.content,
+        answer=(
+            candidate.content
+            if reason is TerminationReason.VERIFIED and candidate is not None
+            else None
+        ),
         status=reason,
         trace=trace,
         candidate=candidate,
@@ -122,8 +135,13 @@ def verify(
     last_evidence: tuple[EvidencePacket, ...] = ()
 
     while len(trace.steps) < active_budget.max_iterations:
-        if trace.model_calls >= active_budget.model_call_limit or _time_exhausted(
-            started, active_budget
+        if (
+            trace.model_calls >= active_budget.model_call_limit
+            or _time_exhausted(started, active_budget)
+            or (
+                active_budget.max_total_tokens is not None
+                and trace.total_tokens >= active_budget.max_total_tokens
+            )
         ):
             return _finalize(trace, TerminationReason.BUDGET_EXHAUSTED, started)
 
@@ -141,6 +159,15 @@ def verify(
                 if isinstance(generated, Candidate)
                 else Candidate(content=str(generated), model_id=model.model_id)
             )
+            usage = Usage.from_candidate(
+                candidate,
+                request_text=canonical_json({"task": task, "state": dict(state)}),
+            )
+            trace.usages.append(usage)
+            if active_budget.max_total_tokens is not None:
+                trace.token_budget_overshoot = max(
+                    0, trace.total_tokens - active_budget.max_total_tokens
+                )
         except Exception as error:  # provider boundary: normalize all adapter failures
             trace.errors.append(_error_record("model", error))
             return _finalize(trace, TerminationReason.MODEL_ERROR, started)
@@ -158,6 +185,7 @@ def verify(
                 break
             trace.verifier_calls += 1
             step_verifier_calls += 1
+            verifier_started = perf_counter()
             try:
                 packet = verifier.verify(task=task, candidate=candidate)
                 if not isinstance(packet, EvidencePacket):
@@ -169,6 +197,8 @@ def verify(
                 trace.errors.append(_error_record("verifier", error))
                 verifier_failed = True
                 break
+            finally:
+                trace.verifier_runtime_seconds += perf_counter() - verifier_started
 
         evidence = tuple(packets)
         residual = EvidenceResidual.from_packets(evidence)
@@ -181,6 +211,7 @@ def verify(
                 model_call=trace.model_calls,
                 verifier_calls=step_verifier_calls,
                 elapsed_seconds=perf_counter() - started,
+                model_usage=usage,
             )
         )
         if verifier_failed:
@@ -192,6 +223,10 @@ def verify(
             len(trace.steps) >= active_budget.max_iterations
             or trace.model_calls >= active_budget.model_call_limit
             or _time_exhausted(started, active_budget)
+            or (
+                active_budget.max_total_tokens is not None
+                and trace.total_tokens >= active_budget.max_total_tokens
+            )
         )
         decision = active_controller.decide(
             trace=trace,

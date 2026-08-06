@@ -1,8 +1,10 @@
 # Provisional paper outline
 
-Working title: **When Should an LLM Think Deeper or Check Reality? Verifier-Conditioned External Recurrence for Frozen Language Models**
+Working title: **Auditing Safe Stopping in Noisy Verify-Repair Loops**
 
-The title is provisional. This is an exploratory outline, not a submission.
+The former “think deeper or check reality” title is retired because it implied a
+broader method contribution already occupied by recurrence, tool-feedback, and
+VRR stopping prior art. This is an exploratory outline, not a submission.
 
 1. Problem: test-time revision can correct or regress answers; verifiers can also fail.
 2. Prior art and PIVOT: recurrence, tool-conditioned correction, CEGIS, adaptive allocation, and noisy verifier work.

@@ -1,0 +1,20 @@
+{
+  "schema_version": "2.0",
+  "seed": 1729,
+  "arithmetic_tasks": 12,
+  "code_tasks": 8,
+  "baselines": [
+    "direct",
+    "no_feedback",
+    "verify_once_repair_once",
+    "fixed_external_loop",
+    "accepted_first",
+    "verifier_best_trajectory",
+    "vcer"
+  ],
+  "evidence_bandwidth": "status_only",
+  "max_iterations": 4,
+  "max_model_calls": 4,
+  "max_verifier_calls": 4,
+  "bootstrap_resamples": 1000
+}

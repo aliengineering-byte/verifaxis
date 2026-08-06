@@ -6,6 +6,9 @@
 - Default arithmetic and restricted-function verifiers do not execute arbitrary candidate Python.
 - The controller exposes named success, budget, plateau, oscillation, conflict, unverifiable, model-error, and verifier-error outcomes.
 - The smoke harness can exercise named baselines and controlled fault types offline.
+- The smoke harness can cache one initial candidate, persist hash-verified
+  baseline-independent fault schedules, and replay implemented policies over a
+  shared maximal trajectory.
 
 These are engineering claims, not model-quality findings.
 
@@ -16,6 +19,7 @@ These are engineering claims, not model-quality findings.
 - Provenance/conflict controls improve real-world verifier robustness.
 - Results generalize across models, domains, verifier families, or corruption processes.
 - The method is novel, SOTA, publication-ready, or hallucination-eliminating.
+- VRR-Guard or VRR-Stop results; those contract baselines remain unavailable.
 
 ## Promotion rule
 

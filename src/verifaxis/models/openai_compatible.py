@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 
-from ..types import Candidate, JSONValue
+from ..types import Candidate, JSONValue, estimate_tokens
 
 
 class OpenAICompatibleModel:
@@ -74,9 +74,10 @@ class OpenAICompatibleModel:
         headers = {"Content-Type": "application/json", **self.extra_headers}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         request = urllib.request.Request(  # noqa: S310 - scheme validated in __init__
             f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+            data=request_body.encode("utf-8"),
             headers=headers,
             method="POST",
         )
@@ -99,11 +100,49 @@ class OpenAICompatibleModel:
         if not isinstance(content, str):
             raise RuntimeError("OpenAI-compatible endpoint returned non-text content")
 
-        metadata: dict[str, JSONValue] = {}
-        usage = parsed.get("usage") if isinstance(parsed, dict) else None
-        if isinstance(usage, dict):
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                value = usage.get(key)
-                if isinstance(value, int):
-                    metadata[key] = value
+        metadata: dict[str, JSONValue] = {"request_character_count": len(request_body)}
+        raw_usage = parsed.get("usage") if isinstance(parsed, dict) else None
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+        def integer(*names: str) -> int | None:
+            for name in names:
+                value = usage.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+            return None
+
+        input_tokens = integer("input_tokens", "prompt_tokens")
+        output_tokens = integer("output_tokens", "completion_tokens")
+        estimated = input_tokens is None or output_tokens is None
+        if input_tokens is None:
+            input_tokens = estimate_tokens(request_body)
+        if output_tokens is None:
+            output_tokens = estimate_tokens(content)
+        total_tokens = integer("total_tokens") or input_tokens + output_tokens
+        prompt_details = usage.get("prompt_tokens_details")
+        completion_details = usage.get("completion_tokens_details")
+        cached_tokens = (
+            prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+        )
+        reasoning_tokens = (
+            completion_details.get("reasoning_tokens", 0)
+            if isinstance(completion_details, dict)
+            else 0
+        )
+        normalized_usage: dict[str, JSONValue] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": max(total_tokens, input_tokens + output_tokens),
+            "cached_tokens": cached_tokens if isinstance(cached_tokens, int) else 0,
+            "reasoning_tokens": reasoning_tokens if isinstance(reasoning_tokens, int) else 0,
+            "estimated": estimated,
+        }
+        for cost_name in ("provider_cost", "cost", "total_cost"):
+            cost = usage.get(cost_name)
+            if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0:
+                normalized_usage["provider_cost"] = float(cost)
+                break
+        metadata["usage"] = normalized_usage
+        if isinstance(raw_usage, dict):
+            metadata["raw_provider_usage"] = raw_usage
         return Candidate(content=content.strip(), model_id=self.model_id, metadata=metadata)

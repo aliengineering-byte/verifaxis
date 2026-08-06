@@ -1,9 +1,17 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "seed": 31415,
-  "arithmetic_tasks": 3,
-  "code_tasks": 1,
-  "baselines": ["fixed_external_loop", "vcer"],
+  "arithmetic_tasks": 12,
+  "code_tasks": 8,
+  "baselines": [
+    "direct",
+    "no_feedback",
+    "verify_once_repair_once",
+    "fixed_external_loop",
+    "accepted_first",
+    "verifier_best_trajectory",
+    "vcer"
+  ],
   "faults": [
     "false_positive",
     "false_negative",
@@ -17,6 +25,7 @@
   ],
   "fault_probability": 1.0,
   "fault_delay_steps": 1,
+  "evidence_bandwidth": "status_only",
   "max_iterations": 4,
   "max_model_calls": 4,
   "max_verifier_calls": 4,

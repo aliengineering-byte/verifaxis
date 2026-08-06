@@ -38,6 +38,6 @@ def test_write_and_load_json_and_html(tmp_path: Path) -> None:
     report = build_report([{"baseline": "direct", "example_id": "1"}])
     json_path = write_report(report, tmp_path / "report.json", format="json")
     html_path = write_report(json_path, tmp_path / "report.html", format="html")
-    assert load_run(json_path)["schema_version"] == "1.0"
+    assert load_run(json_path)["schema_version"] == "2.0"
     assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
     assert json.loads(json_path.read_text(encoding="utf-8"))["kind"] == "evaluation"

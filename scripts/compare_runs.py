@@ -11,7 +11,21 @@ from typing import Any
 def _load(path: Path) -> Any:
     if path.is_dir():
         path = path / "raw_results.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    return _without_measurement_noise(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _without_measurement_noise(value: Any) -> Any:
+    """Remove only explicitly nondeterministic measured-duration fields."""
+
+    if isinstance(value, list):
+        return [_without_measurement_noise(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _without_measurement_noise(item)
+            for key, item in value.items()
+            if key not in {"tool_runtime_seconds", "wall_time_seconds"}
+        }
+    return value
 
 
 def main() -> int:

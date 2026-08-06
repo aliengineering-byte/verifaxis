@@ -26,32 +26,46 @@ class BaselineName(StrEnum):
     VCER = "vcer"
     TOOL_AUGMENTED_INITIAL = "tool_augmented_initial"
     ORACLE_UPPER_BOUND = "oracle_upper_bound"
+    NO_FEEDBACK = "no_feedback"
+    VERIFY_ONCE_REPAIR_ONCE = "verify_once_repair_once"
+    ACCEPTED_FIRST = "accepted_first"
+    VERIFIER_BEST_TRAJECTORY = "verifier_best_trajectory"
+    VRR_GUARD = "vrr_guard"
+    VRR_STOP = "vrr_stop"
 
 
 @dataclass(frozen=True, slots=True)
 class BaselineAccounting:
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
     model_calls: int = 0
     verifier_calls: int = 0
     verifier_runtime_seconds: float = 0.0
     wall_time_seconds: float = 0.0
     token_counts_estimated: bool = True
+    token_budget_overshoot: int = 0
+    monetary_cost: float | None = None
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def to_dict(self) -> dict[str, int | float | bool]:
+    def to_dict(self) -> dict[str, int | float | bool | None]:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "model_calls": self.model_calls,
             "verifier_calls": self.verifier_calls,
             "verifier_runtime_seconds": self.verifier_runtime_seconds,
             "wall_time_seconds": self.wall_time_seconds,
             "token_counts_estimated": self.token_counts_estimated,
+            "token_budget_overshoot": self.token_budget_overshoot,
+            "monetary_cost": self.monetary_cost,
         }
 
 
@@ -92,10 +106,14 @@ class _Ledger:
     started: float = field(default_factory=time.perf_counter)
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
     model_calls: int = 0
     verifier_calls: int = 0
     verifier_runtime_seconds: float = 0.0
-    provider_token_counts_seen: bool = False
+    estimated_counts_seen: bool = False
+    provider_cost_total: float = 0.0
+    provider_cost_missing: bool = False
 
     def _limit(self, name: str) -> Any | None:
         return getattr(self.budget, name, None) if self.budget is not None else None
@@ -106,7 +124,12 @@ class _Ledger:
 
     def can_model_call(self) -> bool:
         limit = self._limit("max_model_calls")
-        return self.within_time() and (limit is None or self.model_calls < int(limit))
+        token_limit = self._limit("max_total_tokens")
+        return (
+            self.within_time()
+            and (limit is None or self.model_calls < int(limit))
+            and (token_limit is None or self.input_tokens + self.output_tokens < int(token_limit))
+        )
 
     def can_verifier_call(self) -> bool:
         limit = self._limit("max_verifier_calls")
@@ -120,20 +143,37 @@ class _Ledger:
                 json.dumps(_serialize(state), sort_keys=True, default=repr)
             )
             self.output_tokens += _estimate_tokens(_candidate_content(candidate))
+            self.estimated_counts_seen = True
+            self.provider_cost_missing = True
         else:
             self.input_tokens += usage[0]
             self.output_tokens += usage[1]
-            self.provider_token_counts_seen = True
+            self.cached_tokens += usage[2]
+            self.reasoning_tokens += usage[3]
+            self.estimated_counts_seen = self.estimated_counts_seen or usage[5]
+            if usage[4] is None:
+                self.provider_cost_missing = True
+            else:
+                self.provider_cost_total += usage[4]
 
     def snapshot(self) -> BaselineAccounting:
         return BaselineAccounting(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
+            cached_tokens=self.cached_tokens,
+            reasoning_tokens=self.reasoning_tokens,
             model_calls=self.model_calls,
             verifier_calls=self.verifier_calls,
             verifier_runtime_seconds=self.verifier_runtime_seconds,
             wall_time_seconds=time.perf_counter() - self.started,
-            token_counts_estimated=not self.provider_token_counts_seen,
+            token_counts_estimated=self.estimated_counts_seen,
+            token_budget_overshoot=max(
+                0,
+                self.input_tokens
+                + self.output_tokens
+                - int(self._limit("max_total_tokens") or self.input_tokens + self.output_tokens),
+            ),
+            monetary_cost=(None if self.provider_cost_missing else self.provider_cost_total),
         )
 
 
@@ -187,7 +227,7 @@ def _candidate_content(candidate: Any) -> str:
     return str(candidate)
 
 
-def _usage(candidate: Any) -> tuple[int, int] | None:
+def _usage(candidate: Any) -> tuple[int, int, int, int, float | None, bool] | None:
     metadata = getattr(candidate, "metadata", None)
     if metadata is None and isinstance(candidate, Mapping):
         metadata = candidate.get("metadata")
@@ -199,7 +239,17 @@ def _usage(candidate: Any) -> tuple[int, int] | None:
     input_value = usage.get("input_tokens")
     output_value = usage.get("output_tokens")
     if isinstance(input_value, int) and isinstance(output_value, int):
-        return input_value, output_value
+        cached = usage.get("cached_tokens", 0)
+        reasoning = usage.get("reasoning_tokens", 0)
+        cost = usage.get("provider_cost", usage.get("cost"))
+        return (
+            input_value,
+            output_value,
+            cached if isinstance(cached, int) else 0,
+            reasoning if isinstance(reasoning, int) else 0,
+            float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None,
+            bool(usage.get("estimated", False)),
+        )
     return None
 
 
@@ -257,25 +307,6 @@ def _independent(packet: Any) -> bool:
     return independent and not bool(llm_produced)
 
 
-def _known_corruption(packet: Any) -> bool:
-    metadata = None
-    for name in ("reliability", "reliability_metadata"):
-        value = packet.get(name) if isinstance(packet, Mapping) else getattr(packet, name, None)
-        if isinstance(value, Mapping):
-            metadata = value
-            break
-    if metadata is None:
-        return False
-    faults = metadata.get("injected_faults", ())
-    if isinstance(faults, str):
-        faults = (faults,)
-    return any(
-        str(item).casefold()
-        in {"false_positive", "malformed_evidence", "stale_evidence", "prompt_injection"}
-        for item in faults
-    )
-
-
 def _evidence_status(packets: Sequence[Any]) -> str:
     applicable = [packet for packet in packets if _independent(packet)]
     if not applicable:
@@ -286,7 +317,7 @@ def _evidence_status(packets: Sequence[Any]) -> str:
     unknown_present = bool(values & {"unknown", "unverifiable"})
     if pass_packets and (fail_present or unknown_present):
         return "VERIFIER_CONFLICT"
-    if pass_packets and all(not _known_corruption(packet) for packet in pass_packets):
+    if pass_packets:
         return "VERIFIED"
     if fail_present:
         return "FAILED"
@@ -312,24 +343,6 @@ def _state(
 
 class _BudgetReached(Exception):
     pass
-
-
-class _FaultAwareController:
-    """Fail closed when an experiment labels evidence as intentionally corrupted."""
-
-    def __init__(self) -> None:
-        from .controller import VerificationController
-
-        self._delegate = VerificationController()
-
-    def decide(self, *, trace: Any, evidence: Sequence[Any], budget_exhausted: bool = False) -> Any:
-        if any(_known_corruption(packet) for packet in evidence):
-            from .types import TerminationReason
-
-            return TerminationReason.UNVERIFIABLE
-        return self._delegate.decide(
-            trace=trace, evidence=evidence, budget_exhausted=budget_exhausted
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,16 +425,17 @@ def _result(
     metadata: Mapping[str, Any] | None = None,
 ) -> BaselineResult:
     accounting = ledger.snapshot()
+    committed = status in {"VERIFIED", "ORACLE_CORRECT"} and not abstained
     return BaselineResult(
         name=name,
-        answer=None if abstained else _candidate_content(candidate),
+        answer=_candidate_content(candidate) if committed else None,
         status=status,
         candidate=candidate,
         candidates=tuple(candidates),
         evidence=tuple(evidence),
         accounting=accounting,
         trace=_synthetic_trace(candidates, evidence, accounting),
-        abstained=abstained,
+        abstained=not committed,
         seed=seed,
         metadata={} if metadata is None else dict(metadata),
     )
@@ -503,12 +517,22 @@ def run_best_of_n(
     n: int = 4,
     budget: Any | None = None,
     score_candidate: Callable[[Any], float] | None = None,
+    selector_accounting: BaselineAccounting | None = None,
 ) -> BaselineResult:
     """Draw ``n`` independent candidates and deterministically select the best.
 
-    A caller-provided scorer is preferred.  Otherwise ``metadata['score']`` is
-    used when present; absent scores are zero and ties preserve generation order.
+    The caller must provide an explicit selector.  Experiments must separately
+    account for any model or verifier calls made by that selector.
     """
+
+    if not callable(score_candidate):
+        raise ValueError("best_of_n requires an explicit score_candidate selector")
+    if selector_accounting is None or (
+        selector_accounting.model_calls == 0
+        and selector_accounting.verifier_calls == 0
+        and selector_accounting.total_tokens == 0
+    ):
+        raise ValueError("best_of_n requires non-zero explicit selector accounting")
 
     limit = _max_iterations(budget, n)
     ledger = _Ledger(budget, limit)
@@ -539,15 +563,21 @@ def run_best_of_n(
     else:
         status = "UNVERIFIABLE"
 
-    def default_score(candidate: Any) -> float:
-        metadata = getattr(candidate, "metadata", None)
-        if metadata is None and isinstance(candidate, Mapping):
-            metadata = candidate.get("metadata")
-        value = metadata.get("score", 0.0) if isinstance(metadata, Mapping) else 0.0
-        return float(value) if isinstance(value, (int, float)) else 0.0
-
-    scorer = default_score if score_candidate is None else score_candidate
-    selected = max(candidates, key=scorer) if candidates else None
+    selected = max(candidates, key=score_candidate) if candidates else None
+    ledger.input_tokens += selector_accounting.input_tokens
+    ledger.output_tokens += selector_accounting.output_tokens
+    ledger.cached_tokens += selector_accounting.cached_tokens
+    ledger.reasoning_tokens += selector_accounting.reasoning_tokens
+    ledger.model_calls += selector_accounting.model_calls
+    ledger.verifier_calls += selector_accounting.verifier_calls
+    ledger.verifier_runtime_seconds += selector_accounting.verifier_runtime_seconds
+    ledger.estimated_counts_seen = (
+        ledger.estimated_counts_seen or selector_accounting.token_counts_estimated
+    )
+    if selector_accounting.monetary_cost is None:
+        ledger.provider_cost_missing = True
+    else:
+        ledger.provider_cost_total += selector_accounting.monetary_cost
     return _result(
         BaselineName.BEST_OF_N,
         selected,
@@ -674,8 +704,6 @@ def run_vcer(
                 "max_iterations": limit,
                 "budget": budget,
             }
-            if core_default:
-                call_options["controller"] = _FaultAwareController()
             core_result = verify_fn(**call_options)
         except Exception as exc:
             ledger = _Ledger(budget, limit, started=started)
@@ -777,11 +805,15 @@ def _accounting_from_trace(trace: Any, started: float) -> BaselineAccounting:
     return BaselineAccounting(
         input_tokens=int(number("input_tokens")),
         output_tokens=int(number("output_tokens")),
+        cached_tokens=int(number("cached_tokens")),
+        reasoning_tokens=int(number("reasoning_tokens")),
         model_calls=int(number("model_calls")),
         verifier_calls=int(number("verifier_calls")),
         verifier_runtime_seconds=float(number("verifier_runtime_seconds")),
         wall_time_seconds=float(number("wall_time_seconds", time.perf_counter() - started)),
         token_counts_estimated=bool(getattr(trace, "token_counts_estimated", True)),
+        token_budget_overshoot=int(number("token_budget_overshoot")),
+        monetary_cost=getattr(trace, "monetary_cost", None),
     )
 
 
@@ -807,10 +839,23 @@ def run_tool_augmented_initial(
     *,
     initial_evidence: Sequence[Any],
     budget: Any | None = None,
+    candidate_independent: bool = False,
+    initial_verifier_calls: int | None = None,
+    initial_verifier_runtime_seconds: float = 0.0,
 ) -> BaselineResult:
-    """Generate one answer with caller-supplied tool evidence available up front."""
+    """Generate once from precomputed, candidate-independent, charged evidence."""
+
+    if not candidate_independent:
+        raise ValueError(
+            "tool_augmented_initial requires candidate_independent=True "
+            "and external tool accounting"
+        )
+    if initial_evidence and (initial_verifier_calls is None or initial_verifier_calls < 1):
+        raise ValueError("initial evidence requires explicit non-zero verifier-call accounting")
 
     ledger = _Ledger(budget, _max_iterations(budget, 1))
+    ledger.verifier_calls = initial_verifier_calls or 0
+    ledger.verifier_runtime_seconds = initial_verifier_runtime_seconds
     state = _state(
         BaselineName.TOOL_AUGMENTED_INITIAL,
         0,
@@ -939,6 +984,7 @@ def run_baseline(name: BaselineName | str, task: str, model: Any, **kwargs: Any)
             n=int(kwargs.get("n", requested_iterations)),
             budget=budget,
             score_candidate=kwargs.get("score_candidate"),
+            selector_accounting=kwargs.get("selector_accounting"),
         )
     if baseline is BaselineName.FIXED_EXTERNAL_LOOP:
         return run_fixed_external_loop(
@@ -972,6 +1018,11 @@ def run_baseline(name: BaselineName | str, task: str, model: Any, **kwargs: Any)
             model,
             initial_evidence=kwargs.get("initial_evidence", ()),
             budget=budget,
+            candidate_independent=bool(kwargs.get("candidate_independent", False)),
+            initial_verifier_calls=kwargs.get("initial_verifier_calls"),
+            initial_verifier_runtime_seconds=float(
+                kwargs.get("initial_verifier_runtime_seconds", 0.0)
+            ),
         )
     if baseline is BaselineName.ORACLE_UPPER_BOUND:
         is_correct = kwargs.get("is_correct")
@@ -985,7 +1036,13 @@ def run_baseline(name: BaselineName | str, task: str, model: Any, **kwargs: Any)
             max_iterations=requested_iterations,
             budget=budget,
         )
-    raise AssertionError(f"unhandled baseline: {baseline}")
+    if baseline in {BaselineName.VRR_GUARD, BaselineName.VRR_STOP}:
+        raise NotImplementedError(
+            f"{baseline.value} is part of the comparison contract but is not faithfully implemented"
+        )
+    raise NotImplementedError(
+        f"{baseline.value} requires shared-trajectory evaluation via verifaxis.trajectory"
+    )
 
 
 # Public aliases matching the terminology used in the research contract.

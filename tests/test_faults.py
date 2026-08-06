@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from verifaxis.faults import FaultConfig, FaultInjector, FaultKind, FaultType, inject_fault
+from verifaxis.faults import (
+    FaultConfig,
+    FaultInjector,
+    FaultKind,
+    FaultSchedule,
+    FaultScheduleKey,
+    FaultType,
+    inject_fault,
+)
 from verifaxis.types import EvidencePacket, EvidenceStatus
 
 
@@ -37,7 +45,7 @@ def test_fault_type_alias_and_config_validation() -> None:
         (FaultKind.FALSE_NEGATIVE, EvidenceStatus.FAIL),
     ],
 )
-def test_status_faults_rehash_and_label_packet(
+def test_status_faults_rehash_without_labeling_packet(
     kind: FaultKind, expected_status: EvidenceStatus
 ) -> None:
     original = packet(
@@ -48,7 +56,14 @@ def test_status_faults_rehash_and_label_packet(
     assert corrupted.status is expected_status
     assert corrupted.validate_hash()
     assert corrupted.timestamp == original.timestamp
-    assert kind.value in corrupted.reliability["injected_faults"]
+    if expected_status is EvidenceStatus.PASS:
+        assert corrupted.counterexample is None
+    else:
+        assert corrupted.counterexample is not None
+    assert corrupted.reliability == original.reliability
+    serialized = str(corrupted.to_dict()).casefold()
+    assert "injected_fault" not in serialized
+    assert kind.value not in serialized
     assert original.status is not corrupted.status
 
 
@@ -80,7 +95,7 @@ def test_contradiction_and_duplication_expand_one_packet() -> None:
     duplicated = inject_fault(original, FaultKind.DUPLICATED_EVIDENCE)
     assert len(duplicated) == 2
     assert duplicated[0] is original
-    assert FaultKind.DUPLICATED_EVIDENCE.value in duplicated[1].reliability["injected_faults"]
+    assert duplicated[1].reliability == original.reliability
 
 
 def test_delay_releases_at_scheduled_step_and_flushes() -> None:
@@ -108,7 +123,7 @@ def test_stale_evidence_replays_prior_packet() -> None:
 
     assert initial.checked_claim == "first"
     assert stale.checked_claim == "first"
-    assert stale.reliability["stale"] is True
+    assert stale.reliability == first.reliability
     assert stale.validate_hash()
 
 
@@ -132,3 +147,26 @@ def test_probability_schedule_is_deterministic_and_does_not_use_global_rng() -> 
     assert left.events == right.events
     assert any(event.applied for event in left.events)
     assert any(not event.applied for event in left.events)
+
+
+def test_frozen_schedule_key_excludes_baseline_and_hash_is_verified() -> None:
+    key = FaultScheduleKey(
+        global_seed=1729,
+        example_id="example-1",
+        verifier_id="unit@1",
+        fault_condition=FaultKind.FALSE_POSITIVE.value,
+    )
+    schedule = FaultSchedule.create(key, steps=20, probability=0.37)
+    same = FaultSchedule.create(key, steps=20, probability=0.37)
+    assert schedule == same
+    assert schedule.validate_hash()
+    assert "baseline" not in schedule.to_dict()["key"]
+
+    config = FaultConfig(FaultKind.FALSE_POSITIVE, probability=0.37, seed=999)
+    left = FaultInjector(config, schedule=schedule)
+    right = FaultInjector(config, schedule=schedule)
+    for step in range(20):
+        left.inject(packet(), step)
+        right.inject(packet(), step)
+    assert [event.applied for event in left.events] == list(schedule.decisions)
+    assert left.events == right.events

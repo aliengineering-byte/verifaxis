@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from verifaxis.baselines import (
+    BaselineAccounting,
     BaselineName,
     run_baseline,
     run_best_of_n,
@@ -80,7 +81,8 @@ def test_dispatcher_filters_common_kwargs_and_supports_alias() -> None:
         seed=99,
     )
     assert direct.name is BaselineName.DIRECT
-    assert direct.answer == "1"
+    assert direct.answer is None
+    assert direct.candidate is not None and direct.candidate.content == "1"
     assert direct.accounting.model_calls == 1
     assert len(direct.trace.steps) == 1
 
@@ -101,7 +103,8 @@ def test_fixed_loop_does_not_stop_after_intermediate_pass() -> None:
     result = run_fixed_external_loop("answer", ScriptedModel(), [NumericVerifier()], rounds=3)
     # The fixture regresses after pass evidence disappears. A fixed loop keeps
     # going and exposes that right->wrong risk instead of hiding it with halting.
-    assert result.answer == "1"
+    assert result.answer is None
+    assert result.candidate is not None and result.candidate.content == "1"
     assert result.status == "FAILED"
     assert result.accounting.model_calls == 3
     assert result.accounting.verifier_calls == 3
@@ -126,9 +129,17 @@ def test_best_of_n_uses_explicit_score_and_accounts_provider_tokens() -> None:
                 },
             )
 
-    result = run_best_of_n("answer", ScoredModel(), n=3)
-    assert result.answer == "3"
+    result = run_best_of_n(
+        "answer",
+        ScoredModel(),
+        n=3,
+        score_candidate=lambda candidate: float(candidate.metadata["score"]),
+        selector_accounting=BaselineAccounting(verifier_calls=3, token_counts_estimated=False),
+    )
+    assert result.answer is None
+    assert result.candidate is not None and result.candidate.content == "3"
     assert result.accounting.total_tokens == 12
+    assert result.accounting.verifier_calls == 3
     assert result.accounting.token_counts_estimated is False
 
 
@@ -157,9 +168,10 @@ def test_vcer_delegates_to_core_and_stops_on_verified_revision() -> None:
     assert result.metadata["delegated"] is True
     assert result.trace.model_calls == 2
     assert result.trace.verifier_calls == 2
+    assert result.accounting.total_tokens == 12
 
 
-def test_vcer_does_not_accept_labeled_false_positive_as_verification() -> None:
+def test_vcer_cannot_peek_at_evaluator_side_false_positive_label() -> None:
     injector = FaultInjector(FaultConfig(FaultKind.FALSE_POSITIVE))
 
     class FaultyVerifier(NumericVerifier):
@@ -169,18 +181,43 @@ def test_vcer_does_not_accept_labeled_false_positive_as_verification() -> None:
             return faulted
 
     result = run_vcer("answer", ScriptedModel(), [FaultyVerifier()], max_iterations=2)
-    assert result.status == "UNVERIFIABLE"
-    assert result.answer is None
+    assert result.status == "VERIFIED"
+    assert result.answer == "1"
     assert result.trace.model_calls == 1
+    assert "false_positive" not in result.trace.to_json()
 
 
 def test_tool_augmented_initial_exposes_evidence_before_first_answer() -> None:
     model = ScriptedModel()
     evidence = [failed_evidence()]
-    result = run_tool_augmented_initial("answer", model, initial_evidence=evidence)
-    assert result.answer == "2"
+    result = run_tool_augmented_initial(
+        "answer",
+        model,
+        initial_evidence=evidence,
+        candidate_independent=True,
+        initial_verifier_calls=1,
+    )
+    assert result.answer is None
+    assert result.candidate is not None and result.candidate.content == "2"
     assert model.calls == 1
     assert model.states[0]["evidence_available_before_first_answer"] is True
+    assert result.accounting.verifier_calls == 1
+
+
+def test_prompt_injection_reaches_model_as_untrusted_data_without_pretermination() -> None:
+    injector = FaultInjector(FaultConfig(FaultKind.PROMPT_INJECTION))
+
+    class FaultyVerifier(NumericVerifier):
+        def verify(self, *, task: str, candidate: Candidate) -> EvidencePacket:
+            [faulted] = injector.inject(super().verify(task=task, candidate=candidate))
+            return faulted
+
+    model = ScriptedModel()
+    result = run_vcer("answer", model, [FaultyVerifier()], max_iterations=2)
+    assert result.status == "VERIFIED"
+    assert model.calls == 2
+    assert "UNTRUSTED_TOOL_OUTPUT" in str(model.states[1])
+    assert "prompt_injection" not in str(model.states[1])
 
 
 def test_oracle_allocation_is_clearly_labeled_and_stops_at_correct_candidate() -> None:

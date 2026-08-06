@@ -41,7 +41,7 @@ def build_report(
         by_baseline.setdefault(str(row.get("baseline", "unknown")), []).append(row)
     summaries = {name: summarize(group) for name, group in sorted(by_baseline.items())}
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "kind": "smoke/demo" if (metadata or {}).get("smoke", False) else "evaluation",
         "metadata": dict(sorted((metadata or {}).items())),
         "summaries": summaries,

@@ -6,7 +6,7 @@ Language models can revise an answer repeatedly without learning whether it is c
 
 VerifAxis is an exploratory research runtime and benchmark. It is not a truth machine and does not eliminate hallucinations.
 
-## Quick start
+## Offline smoke demo
 
 Requires Python 3.11+. Install locally with `python -m pip install .`, then run this five-line example:
 
@@ -66,7 +66,7 @@ flowchart LR
 
 The loop persists candidates, concise structured state, evidence hashes, residuals, budgets, and termination decisions. It neither requests nor stores private chain-of-thought. LLM-generated criticism is always marked as LLM-produced and never silently treated as independent evidence.
 
-The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
+The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. The CLI accepts a JSON model object with `type`, `model`, `base_url`, and optional `api_key_env`; endpoint usage is normalized in the trace. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
 
 ## What VerifAxis does not guarantee
 
@@ -82,8 +82,8 @@ See the [threat model](docs/threat-model.md) and [novelty decision](docs/novelty
 
 ```bash
 verifaxis demo
-verifaxis run examples/arithmetic.yaml
-verifaxis bench --config configs/smoke.yaml
+verifaxis run examples/arithmetic.json
+verifaxis bench --config configs/smoke.json
 verifaxis report runs/latest --format html
 ```
 
@@ -98,7 +98,33 @@ pytest
 python -m build
 ```
 
-The smoke benchmark runs direct, intrinsic Self-Refine, Best-of-N, a fixed external-feedback loop, random stopping, residual-aware VCER, a tool-augmented initial-answer baseline, and an oracle allocation upper bound. Budgets and tool access are reported rather than hidden. See [reproducing](docs/reproducing.md) and the [benchmark card](docs/benchmark-card.md).
+The canonical smoke config runs seven implemented shared-trajectory policies:
+direct, no-feedback, verify-once/repair-once, fixed external feedback,
+accepted-first, verifier-best-trajectory, and VCER. One initial candidate is
+cached across conditions, fault schedules exclude policy identifiers, and the
+primary feedback representation is status-only. VRR-Guard and VRR-Stop are
+required research comparators but are explicitly unavailable, so headline
+experiments remain **BLOCKED**. See [reproducing](docs/reproducing.md), the
+[benchmark card](docs/benchmark-card.md), and the [draft v0.2 contract](docs/research-contract-v0.2-draft.md).
+
+For an OpenAI-compatible local or remote endpoint, use a JSON run config:
+
+```json
+{
+  "task": "What is 197 * 83?",
+  "model": {
+    "type": "openai_compatible",
+    "model": "pinned-model-id",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key_env": "VERIFAXIS_API_KEY"
+  },
+  "verifiers": ["safe_math"],
+  "max_iterations": 4,
+  "max_total_tokens": 4096
+}
+```
+
+No real endpoint is called by the offline demo or smoke benchmark.
 
 ## Add a verifier
 
@@ -106,8 +132,8 @@ Implement the `Verifier` protocol and return an `EvidencePacket` for every appli
 
 ```python
 class MyVerifier:
-    name = "my-verifier"
-    version = "1"
+    verifier_type = "my-verifier"
+    verifier_version = "1"
 
     def verify(self, *, task, candidate): ...
 ```
@@ -116,7 +142,13 @@ Start with `src/verifaxis/verifiers/` and the security boundaries in [CONTRIBUTI
 
 ## Research status
 
-The Phase-0 audit produced a **PIVOT**. External tool-conditioned correction, recurrence, adaptive stopping, and counterexample-guided iteration all have direct prior art. The defensible contribution is a model-agnostic runtime and benchmark for typed evidence, correction/regression dynamics, matched accounting, safe stopping, and verifier-fault experiments. Read the [prior-art audit](docs/prior-art.md) and frozen [research contract](docs/research-contract.md) before interpreting results.
+The Phase-0 audit produced a **PIVOT**. External tool-conditioned correction,
+recurrence, counterexample-guided iteration, noisy verify-repair stopping, and
+matched misleading/no-feedback evaluation all have direct prior art. The
+defensible contribution is an auditable runtime and empirical protocol, not a
+new recurrence or stopping principle. Read the [prior-art audit](docs/prior-art.md)
+and frozen [research contract](docs/research-contract.md) before interpreting
+results.
 
 ## License and citation
 

@@ -75,7 +75,8 @@ def test_model_errors_are_normalized_without_traceback() -> None:
 def test_verifier_errors_fail_closed() -> None:
     result = verify("What is 2 + 2?", ConstantModel("4"), [BrokenVerifier()])
     assert result.status is TerminationReason.VERIFIER_ERROR
-    assert result.answer == "4"
+    assert result.answer is None
+    assert result.candidate is not None and result.candidate.content == "4"
 
 
 def test_verifier_call_budget_is_hard_limit() -> None:
@@ -87,3 +88,42 @@ def test_verifier_call_budget_is_hard_limit() -> None:
     )
     assert result.status is TerminationReason.BUDGET_EXHAUSTED
     assert result.trace.verifier_calls == 1
+
+
+def test_usage_is_aggregated_and_total_token_overshoot_is_honest() -> None:
+    class MeteredModel:
+        model_id = "metered"
+
+        def generate(self, *, task: str, state: Mapping[str, JSONValue]) -> Candidate:
+            del task, state
+            return Candidate(
+                "5",
+                model_id=self.model_id,
+                metadata={
+                    "usage": {
+                        "input_tokens": 8,
+                        "output_tokens": 5,
+                        "total_tokens": 13,
+                        "cached_tokens": 2,
+                        "reasoning_tokens": 1,
+                        "estimated": False,
+                    },
+                    "raw_provider_usage": {"prompt_tokens": 8, "completion_tokens": 5},
+                },
+            )
+
+    result = verify(
+        "What is 2 + 2?",
+        MeteredModel(),
+        [SafeMathVerifier()],
+        budget=Budget(max_iterations=4, max_total_tokens=10),
+    )
+    assert result.status is TerminationReason.BUDGET_EXHAUSTED
+    assert result.trace.model_calls == 1
+    assert result.trace.input_tokens == 8
+    assert result.trace.output_tokens == 5
+    assert result.trace.total_tokens == 13
+    assert result.trace.cached_tokens == 2
+    assert result.trace.reasoning_tokens == 1
+    assert result.trace.token_budget_overshoot == 3
+    assert result.trace.token_counts_estimated is False

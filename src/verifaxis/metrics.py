@@ -29,23 +29,36 @@ def _number(row: Row, key: str, default: float = 0.0) -> float:
     )
 
 
-def _mean(values: Iterable[Number]) -> float:
+def _mean(values: Iterable[Number]) -> float | None:
     items = [float(value) for value in values]
-    return sum(items) / len(items) if items else 0.0
+    return sum(items) / len(items) if items else None
 
 
-def _rate(numerator: int, denominator: int) -> float:
-    return numerator / denominator if denominator else 0.0
+def _nonempty_mean(values: Sequence[float]) -> float:
+    if not values:
+        raise ValueError("mean requires at least one value")
+    return sum(values) / len(values)
 
 
-def risk_coverage_curve(rows: Sequence[Row]) -> list[dict[str, float | int]]:
+def _rate(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def risk_coverage_curve(rows: Sequence[Row]) -> list[dict[str, float | int]] | None:
     """Return the selective risk curve, ordered by descending confidence.
 
     Abstentions are excluded from selectable answers. Ties use ``example_id``
     and then the original row order, so the result is reproducible.
     """
 
-    indexed = [(index, row) for index, row in enumerate(rows) if not _bool(row, "abstained")]
+    answered = [(index, row) for index, row in enumerate(rows) if not _bool(row, "abstained")]
+    if not answered or any(
+        not isinstance(row.get("confidence"), int | float)
+        or isinstance(row.get("confidence"), bool)
+        for _, row in answered
+    ):
+        return None
+    indexed = answered
     indexed.sort(
         key=lambda item: (
             -_number(item[1], "confidence"),
@@ -61,21 +74,21 @@ def risk_coverage_curve(rows: Sequence[Row]) -> list[dict[str, float | int]]:
         curve.append(
             {
                 "selected": selected,
-                "coverage": _rate(selected, total),
-                "risk": _rate(errors, selected),
+                "coverage": selected / total,
+                "risk": errors / selected,
             }
         )
     return curve
 
 
-def expected_calibration_error(rows: Sequence[Row], bins: int = 10) -> float:
+def expected_calibration_error(rows: Sequence[Row], bins: int = 10) -> float | None:
     """Compute equal-width expected calibration error for answered rows."""
 
     if bins < 1:
         raise ValueError("bins must be at least 1")
     answered = [row for row in rows if not _bool(row, "abstained") and "confidence" in row]
     if not answered:
-        return 0.0
+        return None
     ece = 0.0
     for index in range(bins):
         low = index / bins
@@ -87,8 +100,10 @@ def expected_calibration_error(rows: Sequence[Row], bins: int = 10) -> float:
             and (min(1.0, max(0.0, _number(row, "confidence"))) < high or index == bins - 1)
         ]
         if bucket:
-            accuracy = _mean(int(_bool(row, "final_correct")) for row in bucket)
-            confidence = _mean(min(1.0, max(0.0, _number(row, "confidence"))) for row in bucket)
+            accuracy = sum(int(_bool(row, "final_correct")) for row in bucket) / len(bucket)
+            confidence = sum(
+                min(1.0, max(0.0, _number(row, "confidence"))) for row in bucket
+            ) / len(bucket)
             ece += (len(bucket) / len(answered)) * abs(accuracy - confidence)
     return ece
 
@@ -130,6 +145,40 @@ def summarize(rows: Sequence[Row], calibration_bins: int = 10) -> dict[str, Any]
         _number(row, "total_tokens", _number(row, "input_tokens") + _number(row, "output_tokens"))
         for row in rows
     )
+    transitions = {
+        "wrong_to_right": sum(
+            not _bool(row, "initial_correct") and _bool(row, "final_correct") for row in rows
+        ),
+        "right_to_wrong": sum(
+            _bool(row, "initial_correct") and not _bool(row, "final_correct") for row in rows
+        ),
+        "wrong_to_wrong": sum(
+            not _bool(row, "initial_correct") and not _bool(row, "final_correct") for row in rows
+        ),
+        "right_to_right": sum(
+            _bool(row, "initial_correct") and _bool(row, "final_correct") for row in rows
+        ),
+    }
+    curve = risk_coverage_curve(rows)
+    correct_count = sum(_bool(row, "final_correct") for row in rows)
+    cost_values = [
+        float(row["monetary_cost"])
+        for row in rows
+        if isinstance(row.get("monetary_cost"), int | float)
+        and not isinstance(row.get("monetary_cost"), bool)
+    ]
+    total_cost = sum(cost_values) if len(cost_values) == len(rows) else None
+    aurc = None
+    if curve:
+        previous_coverage = 0.0
+        previous_risk = 0.0
+        area = 0.0
+        for point in curve:
+            coverage = float(point["coverage"])
+            risk = float(point["risk"])
+            area += (coverage - previous_coverage) * (risk + previous_risk) / 2.0
+            previous_coverage, previous_risk = coverage, risk
+        aurc = area
     summary: dict[str, Any] = {
         "examples": count,
         "initial_accuracy": _rate(sum(_bool(row, "initial_correct") for row in rows), count),
@@ -160,7 +209,7 @@ def summarize(rows: Sequence[Row], calibration_bins: int = 10) -> dict[str, Any]
         "total_tokens": int(total_tokens),
         "tool_runtime_seconds": sum(_number(row, "tool_runtime_seconds") for row in rows),
         "wall_time_seconds": sum(_number(row, "wall_time_seconds") for row in rows),
-        "monetary_cost": sum(_number(row, "monetary_cost") for row in rows),
+        "monetary_cost": total_cost,
         "average_model_calls": _mean(_number(row, "model_calls") for row in rows),
         "average_verifier_calls": _mean(_number(row, "verifier_calls") for row in rows),
         "average_total_tokens": _mean(
@@ -171,12 +220,20 @@ def summarize(rows: Sequence[Row], calibration_bins: int = 10) -> dict[str, Any]
             )
             for row in rows
         ),
-        "average_monetary_cost": _mean(_number(row, "monetary_cost") for row in rows),
+        "average_monetary_cost": (
+            None if total_cost is None or not rows else total_cost / len(rows)
+        ),
+        "normalized_tokens_per_correct": (total_tokens / correct_count if correct_count else None),
+        "normalized_cost_per_correct": (
+            total_cost / correct_count if total_cost is not None and correct_count else None
+        ),
         "mean_residual_reduction_per_iteration": _mean(residual_reductions),
         "plateau_frequency": _rate(terminations.get("PLATEAU", 0), count),
         "oscillation_frequency": _rate(terminations.get("OSCILLATION", 0), count),
         "termination_counts": dict(sorted(terminations.items())),
-        "risk_coverage": risk_coverage_curve(rows),
+        "transition_counts": transitions,
+        "risk_coverage": curve,
+        "aurc": aurc,
     }
     if any("fault_kind" in row for row in rows):
         summary["fault_robustness"] = robustness_by_fault(rows)
@@ -187,14 +244,14 @@ def summarize(rows: Sequence[Row], calibration_bins: int = 10) -> dict[str, Any]
 compute_metrics = summarize
 
 
-def robustness_by_fault(rows: Sequence[Row]) -> dict[str, dict[str, float | int]]:
+def robustness_by_fault(rows: Sequence[Row]) -> dict[str, dict[str, float | int | None]]:
     """Summarize convergence and safe-stopping outcomes by injected fault."""
 
     groups: dict[str, list[Row]] = {}
     for row in rows:
         key = str(row.get("fault_kind") or "clean")
         groups.setdefault(key, []).append(row)
-    result: dict[str, dict[str, float | int]] = {}
+    result: dict[str, dict[str, float | int | None]] = {}
     for name, group in sorted(groups.items()):
         count = len(group)
         wrong = [row for row in group if not _bool(row, "final_correct")]
@@ -258,7 +315,7 @@ def paired_bootstrap_ci(
     confidence: float = 0.95,
     resamples: int = 10_000,
     seed: int = 0,
-    statistic: Callable[[Sequence[float]], float] = _mean,
+    statistic: Callable[[Sequence[float]], float] = _nonempty_mean,
 ) -> BootstrapInterval:
     """Bootstrap ``treatment - baseline`` while preserving example pairing."""
 
@@ -331,6 +388,62 @@ def exact_mcnemar(baseline: Sequence[bool], treatment: Sequence[bool]) -> McNema
 mcnemar_exact = exact_mcnemar
 
 
+def holm_adjust(p_values: Mapping[str, Number]) -> dict[str, float]:
+    """Return Holm step-down family-wise adjusted p-values."""
+
+    ordered = sorted((float(value), name) for name, value in p_values.items())
+    count = len(ordered)
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    for rank, (value, name) in enumerate(ordered):
+        running = max(running, min(1.0, (count - rank) * value))
+        adjusted[name] = running
+    return dict(sorted(adjusted.items()))
+
+
+def paired_cluster_bootstrap_ci(
+    baseline_rows: Sequence[Row],
+    treatment_rows: Sequence[Row],
+    *,
+    seed: int = 0,
+    resamples: int = 10_000,
+    confidence: float = 0.95,
+) -> BootstrapInterval:
+    """Bootstrap paired accuracy differences by task cluster, not individual row."""
+
+    baseline_by_id = {str(row.get("example_id")): row for row in baseline_rows}
+    treatment_by_id = {str(row.get("example_id")): row for row in treatment_rows}
+    if baseline_by_id.keys() != treatment_by_id.keys() or not baseline_by_id:
+        raise ValueError("paired rows must contain identical non-empty example_id sets")
+    clusters: dict[str, list[float]] = {}
+    for identifier in sorted(baseline_by_id):
+        baseline = baseline_by_id[identifier]
+        treatment = treatment_by_id[identifier]
+        cluster = str(baseline.get("task_cluster", baseline.get("domain", identifier)))
+        clusters.setdefault(cluster, []).append(
+            float(_bool(treatment, "final_correct")) - float(_bool(baseline, "final_correct"))
+        )
+    cluster_names = sorted(clusters)
+    cluster_effects = [_nonempty_mean(clusters[name]) for name in cluster_names]
+    estimate = _nonempty_mean(cluster_effects)
+    generator = random.Random(seed)  # noqa: S311 - deterministic scientific bootstrap
+    samples = sorted(
+        _nonempty_mean(
+            [cluster_effects[generator.randrange(len(cluster_effects))] for _ in cluster_effects]
+        )
+        for _ in range(resamples)
+    )
+    alpha = (1.0 - confidence) / 2.0
+    return BootstrapInterval(
+        estimate=estimate,
+        low=_percentile(samples, alpha),
+        high=_percentile(samples, 1.0 - alpha),
+        confidence=confidence,
+        resamples=resamples,
+        seed=seed,
+    )
+
+
 def paired_comparison(
     baseline_rows: Sequence[Row],
     treatment_rows: Sequence[Row],
@@ -347,15 +460,15 @@ def paired_comparison(
     identifiers = sorted(baseline_by_id)
     baseline_correct = [_bool(baseline_by_id[key], "final_correct") for key in identifiers]
     treatment_correct = [_bool(treatment_by_id[key], "final_correct") for key in identifiers]
-    interval = paired_bootstrap_ci(
-        baseline_correct,
-        treatment_correct,
+    interval = paired_cluster_bootstrap_ci(
+        baseline_rows,
+        treatment_rows,
         seed=seed,
         resamples=resamples,
     )
     test = exact_mcnemar(baseline_correct, treatment_correct)
     return {
         "example_ids": identifiers,
-        "accuracy_difference_bootstrap": interval.to_dict(),
+        "accuracy_difference_task_cluster_bootstrap": interval.to_dict(),
         "mcnemar_exact": test.to_dict(),
     }

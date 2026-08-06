@@ -2,6 +2,9 @@
 
 Status: frozen for v0.1 smoke/demo on 2026-08-06. No headline experiment is authorized by this version. Exact public-benchmark manifests and real-model snapshot identifiers must be added in a reviewed amendment before headline runs.
 
+The proposed amendment is [v0.2 draft](research-contract-v0.2-draft.md). It is
+explicitly blocked and does not modify this frozen v0.1 contract.
+
 ## Research question
 
 Under matched inference budgets, when does verifier-conditioned external recurrence (VCER) improve or degrade the cost–risk–coverage frontier for frozen language models, especially when verifier feedback is incomplete, conflicting, stale, malformed, or corrupted?
@@ -113,4 +116,3 @@ Engineering release failure includes nondeterministic smoke output, a false `VER
 - generalization from scripted fixtures or a single model/domain;
 - causal attribution to recurrence when tool access, prompts, budgets, or selection differ;
 - SOTA or conference-readiness claims without the complete gate in `docs/novelty-decision.md`.
-

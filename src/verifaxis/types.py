@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -105,6 +106,109 @@ class Candidate:
             "model_id": self.model_id,
             "metadata": dict(self.metadata),
             "fingerprint": self.fingerprint,
+        }
+
+
+def estimate_tokens(value: str) -> int:
+    """Return a deterministic provider-neutral token proxy.
+
+    Provider-reported counts always take precedence.  The proxy deliberately
+    counts punctuation so serialized request envelopes are not reduced to the
+    task's whitespace-delimited words.
+    """
+
+    return len(re.findall(r"\w+|[^\w\s]", value, flags=re.UNICODE))
+
+
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """Normalized accounting for one completed model request."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    estimated: bool = True
+    provider_cost: float | None = None
+    raw_provider_usage: dict[str, JSONValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if self.total_tokens < self.input_tokens + self.output_tokens:
+            raise ValueError("total_tokens cannot be less than input_tokens + output_tokens")
+        if self.provider_cost is not None and self.provider_cost < 0:
+            raise ValueError("provider_cost cannot be negative")
+
+    @classmethod
+    def from_candidate(
+        cls,
+        candidate: Candidate,
+        *,
+        request_text: str,
+    ) -> Usage:
+        metadata = candidate.metadata
+        raw_usage = metadata.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+        def token(*names: str) -> int | None:
+            for name in names:
+                value = usage.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+            return None
+
+        input_tokens = token("input_tokens", "prompt_tokens")
+        output_tokens = token("output_tokens", "completion_tokens")
+        provider_counts = input_tokens is not None and output_tokens is not None
+        if input_tokens is None:
+            input_tokens = estimate_tokens(request_text)
+        if output_tokens is None:
+            output_tokens = estimate_tokens(candidate.content)
+        reported_total = token("total_tokens")
+        total_tokens = max(input_tokens + output_tokens, reported_total or 0)
+        cached_tokens = token("cached_tokens") or 0
+        reasoning_tokens = token("reasoning_tokens") or 0
+        cost = usage.get("provider_cost", usage.get("cost"))
+        provider_cost = (
+            float(cost)
+            if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0
+            else None
+        )
+        raw = metadata.get("raw_provider_usage")
+        return cls(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            estimated=(
+                bool(usage.get("estimated"))
+                if isinstance(usage.get("estimated"), bool)
+                else not provider_counts
+            ),
+            provider_cost=provider_cost,
+            raw_provider_usage=dict(raw) if isinstance(raw, dict) else dict(usage),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "estimated": self.estimated,
+            "provider_cost": self.provider_cost,
+            "raw_provider_usage": dict(self.raw_provider_usage),
         }
 
 
@@ -291,6 +395,7 @@ class LoopStep:
     model_call: int
     verifier_calls: int
     elapsed_seconds: float
+    model_usage: Usage = field(default_factory=lambda: Usage(0, 0, 0))
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
@@ -301,6 +406,7 @@ class LoopStep:
             "model_call": self.model_call,
             "verifier_calls": self.verifier_calls,
             "elapsed_seconds": self.elapsed_seconds,
+            "model_usage": self.model_usage.to_dict(),
         }
 
 
@@ -316,11 +422,51 @@ class RunTrace:
     model_calls: int = 0
     verifier_calls: int = 0
     elapsed_seconds: float = 0.0
+    verifier_runtime_seconds: float = 0.0
+    usages: list[Usage] = field(default_factory=list)
+    token_budget_overshoot: int = 0
     errors: list[dict[str, JSONValue]] = field(default_factory=list)
 
     @property
     def final_candidate(self) -> Candidate | None:
         return self.steps[-1].candidate if self.steps else None
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(usage.input_tokens for usage in self.usages)
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(usage.output_tokens for usage in self.usages)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(usage.total_tokens for usage in self.usages)
+
+    @property
+    def cached_tokens(self) -> int:
+        return sum(usage.cached_tokens for usage in self.usages)
+
+    @property
+    def reasoning_tokens(self) -> int:
+        return sum(usage.reasoning_tokens for usage in self.usages)
+
+    @property
+    def monetary_cost(self) -> float | None:
+        costs = [usage.provider_cost for usage in self.usages]
+        return (
+            sum(cost for cost in costs if cost is not None)
+            if any(cost is not None for cost in costs)
+            else None
+        )
+
+    @property
+    def token_counts_estimated(self) -> bool:
+        return not self.usages or any(usage.estimated for usage in self.usages)
+
+    @property
+    def wall_time_seconds(self) -> float:
+        return self.elapsed_seconds
 
     def finish(self, reason: TerminationReason, elapsed_seconds: float) -> None:
         self.termination_reason = reason
@@ -329,7 +475,7 @@ class RunTrace:
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "task": self.task,
             "steps": [step.to_dict() for step in self.steps],
             "termination_reason": (
@@ -340,6 +486,18 @@ class RunTrace:
             "model_calls": self.model_calls,
             "verifier_calls": self.verifier_calls,
             "elapsed_seconds": self.elapsed_seconds,
+            "verifier_runtime_seconds": self.verifier_runtime_seconds,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.total_tokens,
+                "cached_tokens": self.cached_tokens,
+                "reasoning_tokens": self.reasoning_tokens,
+                "estimated": self.token_counts_estimated,
+                "provider_cost": self.monetary_cost,
+                "calls": [usage.to_dict() for usage in self.usages],
+            },
+            "token_budget_overshoot": self.token_budget_overshoot,
             "errors": list(self.errors),
         }
 
@@ -364,6 +522,7 @@ class Budget:
     max_model_calls: int | None = None
     max_verifier_calls: int | None = None
     max_wall_time_seconds: float | None = None
+    max_total_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1:
@@ -374,6 +533,8 @@ class Budget:
             raise ValueError("max_verifier_calls must be at least one")
         if self.max_wall_time_seconds is not None and self.max_wall_time_seconds <= 0:
             raise ValueError("max_wall_time_seconds must be positive")
+        if self.max_total_tokens is not None and self.max_total_tokens < 1:
+            raise ValueError("max_total_tokens must be at least one")
 
     @property
     def model_call_limit(self) -> int:
@@ -384,7 +545,7 @@ class Budget:
 class VerificationResult:
     """The final answer, status, and complete audit trace."""
 
-    answer: str
+    answer: str | None
     status: TerminationReason
     trace: RunTrace
     candidate: Candidate | None
