@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "name": "verifaxis-generated-smoke",
+  "label": "smoke/demo",
+  "domains": ["arithmetic", "restricted_code"],
+  "generator": "verifaxis.bench",
+  "ground_truth": "generated-deterministic",
+  "license": "Apache-2.0",
+  "contamination_note": "Synthetic smoke tasks are for CI and demonstration, not research claims.",
+  "code_execution": false,
+  "default_seed": 1729
+}

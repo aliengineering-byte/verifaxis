@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "task": "What is 197 * 83?",
+  "model": "replay",
+  "verifiers": ["safe_math"],
+  "max_iterations": 4
+}
