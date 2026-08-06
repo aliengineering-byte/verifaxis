@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use VerifAxis, please cite the software."
+title: "VerifAxis"
+type: software
+version: 0.1.0
+date-released: 2026-08-06
+authors:
+  - name: Ali
+repository-code: "https://github.com/aliengineering-byte/verifaxis"
+url: "https://github.com/aliengineering-byte/verifaxis"
+license: Apache-2.0
+abstract: "A model-agnostic runtime and benchmark for verifier-conditioned external recurrence with typed evidence and safe stopping."

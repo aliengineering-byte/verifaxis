@@ -1,0 +1,25 @@
+name: Research proposal
+description: Propose a verifier, benchmark, baseline, or preregistered experiment
+title: "[research] "
+labels: [research]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question and falsifiable hypothesis
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Paired design and claim boundary
+      description: Include datasets/licenses, models, budgets, baselines, seeds, metrics, and failure criteria.
+    validations:
+      required: true
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: Contract
+      options:
+        - label: I will submit a dated research-contract amendment before inspecting primary results.
+          required: true
