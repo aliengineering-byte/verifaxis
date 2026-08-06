@@ -5,6 +5,7 @@ import pytest
 from verifaxis.metrics import (
     exact_mcnemar,
     expected_calibration_error,
+    holm_adjust,
     paired_bootstrap_ci,
     paired_comparison,
     risk_coverage_curve,
@@ -114,3 +115,28 @@ def test_invalid_metric_arguments() -> None:
         exact_mcnemar([True], [])
     with pytest.raises(ValueError):
         expected_calibration_error([], bins=0)
+
+
+def test_undefined_rates_and_confidence_metrics_are_null() -> None:
+    summary = summarize(
+        [
+            {
+                "example_id": "right",
+                "initial_correct": True,
+                "final_correct": True,
+                "verified": False,
+                "abstained": True,
+            }
+        ]
+    )
+    assert summary["correction_rate"] is None
+    assert summary["false_verification_rate"] is None
+    assert summary["ece"] is None
+    assert summary["risk_coverage"] is None
+    assert summary["aurc"] is None
+    assert summary["transition_counts"]["right_to_right"] == 1
+
+
+def test_holm_adjustment_is_monotone_in_sorted_order() -> None:
+    adjusted = holm_adjust({"a": 0.01, "b": 0.04, "c": 0.03})
+    assert adjusted == {"a": 0.03, "b": 0.06, "c": 0.06}

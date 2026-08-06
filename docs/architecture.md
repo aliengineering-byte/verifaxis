@@ -27,6 +27,21 @@ p_{z+1} = A_phi(p_z, h_z, Encode(e_z))
 
 Provider, verifier, controller, trace storage, and reporting boundaries remain separate so experiments can change one factor at a time.
 
+## Paired evaluation path
+
+The pilot harness is separate from the live convenience loop. It makes one
+candidate-independent initial call, caches the candidate and usage, and reuses
+them across clean/no-feedback/fault conditions. Each condition produces one
+maximal trajectory with the same revision-state builder, evidence serializer,
+and bandwidth. Stopping and selection policies replay that trajectory offline;
+their names cannot influence sampling or fault scheduling.
+
+The primary bandwidth is status-only. Counterexamples are an explicit ablation
+and are serialized as untrusted data. Evaluator truth and fault labels never
+enter the model/controller representation. An unverified terminal returns
+`answer=null`; the last candidate remains separately available for audit and
+candidate-quality metrics.
+
 ## State machine
 
 ```mermaid
@@ -49,9 +64,13 @@ Pass/fail status from an LLM-generated component may be recorded, but cannot ind
 
 ## Operating modes
 
-### Black-box text recurrence (v0.1)
+### Black-box text recurrence
 
-The model receives the task, previous candidate, failed constraints, machine counterexamples, unresolved residual, and remaining budget. `OpenAICompatibleModel` uses an explicitly configured endpoint. `ReplayModel` is the offline deterministic fixture.
+The convenience runtime can carry full structured evidence. The paired pilot
+uses the shared status-only serializer above. `OpenAICompatibleModel` calls only
+an explicitly configured endpoint and records normalized input/output, cached,
+reasoning, raw-provider usage, estimated/provider flags, and available cost.
+`ReplayModel` is the offline deterministic fixture.
 
 ### Open-weight latent recurrence (future)
 

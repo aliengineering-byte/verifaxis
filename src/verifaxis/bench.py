@@ -8,13 +8,24 @@ import random
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .faults import FaultConfig, FaultInjector, FaultKind
-from .metrics import paired_comparison, summarize
+from .faults import (
+    FaultConfig,
+    FaultInjector,
+    FaultKind,
+    FaultSchedule,
+    FaultScheduleKey,
+)
+from .metrics import holm_adjust, paired_comparison, summarize
 from .reporting import canonical_json
+from .trajectory import (
+    EvidenceBandwidth,
+    build_maximal_trajectory,
+    generate_initial,
+    replay_trajectory,
+)
 from .types import (
     Budget,
     Candidate,
@@ -46,24 +57,29 @@ class BenchmarkCase:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
-    """JSON-valid-YAML smoke configuration."""
+    """Strict JSON smoke configuration."""
 
     seed: int = 0
-    arithmetic_tasks: int = 4
-    code_tasks: int = 2
+    arithmetic_tasks: int = 12
+    code_tasks: int = 8
     baselines: tuple[str, ...] = (
         "direct",
-        "self_refine",
+        "no_feedback",
+        "verify_once_repair_once",
         "fixed_external_loop",
+        "accepted_first",
+        "verifier_best_trajectory",
         "vcer",
     )
     max_iterations: int = 4
     max_model_calls: int = 4
     max_verifier_calls: int = 4
+    max_total_tokens: int | None = None
     bootstrap_resamples: int = 1_000
     faults: tuple[str, ...] = ()
     fault_probability: float = 1.0
     fault_delay_steps: int = 1
+    evidence_bandwidth: str = "status_only"
 
     def __post_init__(self) -> None:
         if self.arithmetic_tasks < 0 or self.code_tasks < 0:
@@ -78,8 +94,12 @@ class BenchmarkConfig:
             raise ValueError("fault_probability must be between 0 and 1")
         if self.fault_delay_steps < 1:
             raise ValueError("fault_delay_steps must be positive")
+        if self.max_total_tokens is not None and self.max_total_tokens < 1:
+            raise ValueError("max_total_tokens must be positive")
+        EvidenceBandwidth(self.evidence_bandwidth)
         for name in self.faults:
-            FaultKind(name)
+            if name not in {"clean", "no_feedback"}:
+                FaultKind(name)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> BenchmarkConfig:
@@ -91,17 +111,19 @@ class BenchmarkConfig:
             "max_iterations",
             "max_model_calls",
             "max_verifier_calls",
+            "max_total_tokens",
             "bootstrap_resamples",
             "schema_version",
             "output_dir",
             "faults",
             "fault_probability",
             "fault_delay_steps",
+            "evidence_bandwidth",
         }
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"unknown benchmark config fields: {', '.join(sorted(unknown))}")
-        baselines = value.get("baselines", ("direct", "self_refine", "fixed_external_loop", "vcer"))
+        baselines = value.get("baselines", cls().baselines)
         if not isinstance(baselines, Sequence) or isinstance(baselines, (str, bytes)):
             raise ValueError("baselines must be an array of names")
         faults = value.get("faults", ())
@@ -109,29 +131,31 @@ class BenchmarkConfig:
             raise ValueError("faults must be an array of FaultKind values")
         return cls(
             seed=int(value.get("seed", 0)),
-            arithmetic_tasks=int(value.get("arithmetic_tasks", 4)),
-            code_tasks=int(value.get("code_tasks", 2)),
+            arithmetic_tasks=int(value.get("arithmetic_tasks", 12)),
+            code_tasks=int(value.get("code_tasks", 8)),
             baselines=tuple(str(name) for name in baselines),
             max_iterations=int(value.get("max_iterations", 4)),
             max_model_calls=int(value.get("max_model_calls", 4)),
             max_verifier_calls=int(value.get("max_verifier_calls", 4)),
+            max_total_tokens=(
+                None if value.get("max_total_tokens") is None else int(value["max_total_tokens"])
+            ),
             bootstrap_resamples=int(value.get("bootstrap_resamples", 1_000)),
             faults=tuple(str(name) for name in faults),
             fault_probability=float(value.get("fault_probability", 1.0)),
             fault_delay_steps=int(value.get("fault_delay_steps", 1)),
+            evidence_bandwidth=str(value.get("evidence_bandwidth", "status_only")),
         )
 
 
 def load_config(path: str | Path) -> BenchmarkConfig:
-    """Load a ``.json`` or JSON-valid ``.yaml`` config with stdlib JSON only."""
+    """Load a strict ``.json`` config with the standard-library parser."""
 
     source = Path(path)
     try:
         value = json.loads(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
-        raise ValueError(
-            f"{source} must be JSON (JSON is valid YAML); YAML tags are intentionally unsupported"
-        ) from error
+        raise ValueError(f"{source} must be strict JSON; YAML syntax is unsupported") from error
     if not isinstance(value, dict):
         raise ValueError("benchmark config must be an object")
     return BenchmarkConfig.from_mapping(value)
@@ -291,6 +315,7 @@ class _ScriptedSmokeModel:
     def __init__(self, case: BenchmarkCase) -> None:
         self.case = case
         self.calls = 0
+        self.states: list[Mapping[str, JSONValue]] = []
 
     @property
     def model_id(self) -> str:
@@ -299,9 +324,10 @@ class _ScriptedSmokeModel:
     def generate(self, *, task: str, state: Mapping[str, JSONValue]) -> Candidate:
         del task
         self.calls += 1
+        self.states.append(state)
         answer = (
             self.case.expected
-            if _has_trusted_failure(state.get("evidence"))
+            if _has_failure_status(state.get("evidence"))
             else self.case.initial_answer
         )
         return Candidate(
@@ -311,24 +337,10 @@ class _ScriptedSmokeModel:
         )
 
 
-def _has_trusted_failure(value: object) -> bool:
+def _has_failure_status(value: object) -> bool:
     if not isinstance(value, list):
         return False
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        packet = dict(item)
-        supplied_hash = packet.pop("content_hash", None)
-        counterexample = packet.get("counterexample")
-        if (
-            supplied_hash == content_digest(packet)
-            and packet.get("status") == "FAIL"
-            and packet.get("independence") == "INDEPENDENT"
-            and packet.get("llm_produced") is False
-            and isinstance(counterexample, dict)
-        ):
-            return True
-    return False
+    return any(isinstance(item, dict) and item.get("status") == "FAIL" for item in value)
 
 
 class _CaseVerifier:
@@ -353,7 +365,10 @@ class _CaseVerifier:
             checked_claim=f"candidate satisfies {self.case.example_id}",
             counterexample=None
             if correct
-            else {"actual": candidate.content, "expected": self.case.expected},
+            else {
+                "observed": candidate.content,
+                "constraint": "candidate failed the deterministic benchmark check",
+            },
             provenance={"benchmark": "generated-smoke", "example_id": self.case.example_id},
             timestamp="1970-01-01T00:00:00Z",
             independence=IndependenceClassification.INDEPENDENT,
@@ -369,18 +384,19 @@ class _FaultingVerifier:
         self,
         verifier: Any,
         config: FaultConfig,
+        schedule: FaultSchedule,
         *,
         output_index: int = 0,
     ) -> None:
         self.verifier = verifier
-        self.injector = FaultInjector(config)
+        self.injector = FaultInjector(config, schedule=schedule)
         self.config = config
         self.output_index = output_index
         self.step = 0
 
     @property
     def verifier_type(self) -> str:
-        return f"fault/{self.config.kind.value}/{self.verifier.verifier_type}"
+        return str(self.verifier.verifier_type)
 
     @property
     def verifier_version(self) -> str:
@@ -399,25 +415,21 @@ class _FaultingVerifier:
             verifier_version=self.verifier_version,
             status=EvidenceStatus.UNKNOWN,
             checked_claim="evidence is available at the current recurrence step",
-            counterexample={
-                "fault_kind": self.config.kind.value,
-                "release_step": self.step - 1 + self.config.delay_steps,
-            },
-            provenance={"benchmark": "generated-fault-smoke"},
+            counterexample=None,
+            provenance={"benchmark": "generated-smoke"},
             timestamp="1970-01-01T00:00:00Z",
             independence=IndependenceClassification.INDEPENDENT,
-            reliability={
-                "deterministic": True,
-                "injected_faults": [self.config.kind.value],
-            },
+            reliability={"deterministic": True},
             llm_produced=False,
         )
 
 
-def _faulting_verifiers(verifier: Any, config: FaultConfig) -> list[_FaultingVerifier]:
-    first = _FaultingVerifier(verifier, config)
+def _faulting_verifiers(
+    verifier: Any, config: FaultConfig, schedule: FaultSchedule
+) -> list[_FaultingVerifier]:
+    first = _FaultingVerifier(verifier, config, schedule)
     if config.kind in {FaultKind.CONTRADICTORY_OUTPUTS, FaultKind.DUPLICATED_EVIDENCE}:
-        return [first, _FaultingVerifier(verifier, config, output_index=1)]
+        return [first, _FaultingVerifier(verifier, config, schedule, output_index=1)]
     return [first]
 
 
@@ -454,9 +466,11 @@ def _result_row(
     seed: int,
     fault_kind: FaultKind | None = None,
     fault_verifiers: Sequence[_FaultingVerifier] = (),
+    fault_schedule: FaultSchedule | None = None,
+    fault_condition: str = "clean",
 ) -> dict[str, Any]:
-    raw_answer = getattr(result, "answer", "")
-    answer = "" if raw_answer is None else str(raw_answer)
+    raw_answer = getattr(result, "answer", None)
+    answer = None if raw_answer is None else str(raw_answer)
     status_value = getattr(result, "status", TerminationReason.UNVERIFIABLE)
     status = getattr(status_value, "value", str(status_value))
     trace = getattr(result, "trace", None)
@@ -464,10 +478,13 @@ def _result_row(
     candidates = list(getattr(result, "candidates", []))
     if trace_steps:
         candidate_answers = [step.candidate.content for step in trace_steps]
-        residual_history = [
-            len(step.residual.failed_constraints) + len(step.residual.unresolved_claims)
-            for step in trace_steps
-        ]
+        residual_history = []
+        for step in trace_steps:
+            residual = getattr(step, "residual", None)
+            if residual is not None:
+                residual_history.append(
+                    len(residual.failed_constraints) + len(residual.unresolved_claims)
+                )
     else:
         candidate_answers = [
             str(getattr(candidate, "content", candidate)) for candidate in candidates
@@ -476,7 +493,13 @@ def _result_row(
     evidence_packets = [packet for step in trace_steps for packet in getattr(step, "evidence", ())]
     if not evidence_packets:
         evidence_packets = list(getattr(result, "evidence", ()))
-    first_answer = candidate_answers[0] if candidate_answers else answer
+    selected_candidate = getattr(result, "candidate", None)
+    last_candidate = (
+        str(getattr(selected_candidate, "content", selected_candidate))
+        if selected_candidate is not None
+        else (candidate_answers[-1] if candidate_answers else None)
+    )
+    first_answer = candidate_answers[0] if candidate_answers else last_candidate
     accounting = getattr(result, "accounting", None)
     model_calls = int(
         getattr(accounting, "model_calls", getattr(trace, "model_calls", len(candidate_answers)))
@@ -499,10 +522,11 @@ def _result_row(
     if candidate_answers and output_tokens == 0:
         output_tokens = sum(_token_count(value) for value in candidate_answers)
     abstained = bool(getattr(result, "abstained", status != "VERIFIED"))
-    final_correct = answer_is_correct(case, answer)
+    final_correct = last_candidate is not None and answer_is_correct(case, last_candidate)
     row: dict[str, Any] = {
-        "schema_version": "1.0",
-        "example_id": case.example_id,
+        "schema_version": "2.0",
+        "case_id": case.example_id,
+        "example_id": f"{case.example_id}::condition={fault_condition}",
         "domain": case.domain,
         "seed": seed,
         "baseline": baseline,
@@ -510,11 +534,12 @@ def _result_row(
         "expected": case.expected,
         "initial_answer": first_answer,
         "final_answer": answer,
-        "initial_correct": answer_is_correct(case, first_answer),
+        "last_candidate": last_candidate,
+        "initial_correct": first_answer is not None and answer_is_correct(case, first_answer),
         "final_correct": final_correct,
+        "committed_correct": answer is not None and answer_is_correct(case, answer),
         "verified": status == "VERIFIED",
         "abstained": abstained,
-        "confidence": 1.0 if status == "VERIFIED" else 0.0,
         "termination_reason": status,
         "iterations": len(candidate_answers),
         "model_calls": model_calls,
@@ -522,10 +547,13 @@ def _result_row(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "token_count_estimated": True,
-        "tool_runtime_seconds": 0.0,
-        "wall_time_seconds": 0.0,
-        "monetary_cost": 0.0,
+        "cached_tokens": int(getattr(accounting, "cached_tokens", 0)),
+        "reasoning_tokens": int(getattr(accounting, "reasoning_tokens", 0)),
+        "token_count_estimated": bool(getattr(accounting, "token_counts_estimated", True)),
+        "token_budget_overshoot": int(getattr(accounting, "token_budget_overshoot", 0)),
+        "tool_runtime_seconds": float(getattr(accounting, "verifier_runtime_seconds", 0.0)),
+        "wall_time_seconds": float(getattr(accounting, "wall_time_seconds", 0.0)),
+        "monetary_cost": getattr(accounting, "monetary_cost", None),
         "residual_history": residual_history,
         "evidence": [_evidence_summary(packet) for packet in evidence_packets],
     }
@@ -534,8 +562,6 @@ def _result_row(
         applied = any(event.applied for event in events)
         row.update(
             {
-                "case_id": case.example_id,
-                "example_id": f"{case.example_id}::fault={fault_kind.value}",
                 "fault_kind": fault_kind.value,
                 "fault_applied": applied,
                 "fault_events": [
@@ -552,6 +578,10 @@ def _result_row(
                 "safe_stopped": applied and status != "VERIFIED" and abstained,
             }
         )
+    else:
+        row["fault_kind"] = fault_condition
+    if fault_schedule is not None:
+        row["fault_schedule_hash"] = fault_schedule.schedule_hash
     return row
 
 
@@ -559,19 +589,7 @@ def run_benchmark(
     config: BenchmarkConfig | Mapping[str, Any] | str | Path,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run every baseline/case pairing and optionally persist canonical raw rows."""
-
-    from .baselines import (
-        BaselineName,
-        run_best_of_n,
-        run_direct,
-        run_fixed_external_loop,
-        run_oracle_upper_bound,
-        run_random_stopping,
-        run_self_refine,
-        run_tool_augmented_initial,
-        run_vcer,
-    )
+    """Generate paired trajectories once and replay all stopping policies offline."""
 
     if isinstance(config, (str, Path)):
         active = load_config(config)
@@ -586,105 +604,101 @@ def run_benchmark(
         max_iterations=active.max_iterations,
         max_model_calls=active.max_model_calls,
         max_verifier_calls=active.max_verifier_calls,
+        max_total_tokens=active.max_total_tokens,
     )
     rows: list[dict[str, Any]] = []
+    schedules: list[FaultSchedule] = []
     aliases = {
         "fixed_external": "fixed_external_loop",
         "fixed_verifier_loop": "fixed_external_loop",
+        "stop_on_pass": "accepted_first",
     }
     normalized_baselines = tuple(aliases.get(name, name) for name in active.baselines)
-    fault_conditions: tuple[FaultKind | None, ...] = (
-        tuple(FaultKind(name) for name in active.faults) if active.faults else (None,)
-    )
-    for baseline_index, baseline in enumerate(normalized_baselines):
-        for case_index, case in enumerate(cases):
-            for fault_index, fault_kind in enumerate(fault_conditions):
-                row_seed = (
-                    active.seed + baseline_index * 100_000 + fault_index * 10_000 + case_index
+    unavailable = sorted(name for name in normalized_baselines if name in {"vrr_guard", "vrr_stop"})
+    runnable = tuple(name for name in normalized_baselines if name not in unavailable)
+    supported = {
+        "direct",
+        "no_feedback",
+        "verify_once_repair_once",
+        "fixed_external_loop",
+        "accepted_first",
+        "verifier_best_trajectory",
+        "vcer",
+    }
+    unknown = set(runnable) - supported
+    if unknown:
+        raise ValueError(
+            "baselines are not shared-trajectory policies: " + ", ".join(sorted(unknown))
+        )
+    conditions = list(dict.fromkeys(active.faults))
+    for control in ("clean", "no_feedback"):
+        if control not in conditions:
+            conditions.insert(0 if control == "clean" else 1, control)
+    bandwidth = EvidenceBandwidth(active.evidence_bandwidth)
+
+    for case in cases:
+        cached_initial = generate_initial(
+            case.task,
+            _ScriptedSmokeModel(case),
+            budget=budget,
+            bandwidth=bandwidth,
+        )
+        for condition in conditions:
+            verifier = (
+                RestrictedPythonVerifier(case.test_cases, function_name="solve")
+                if case.domain == "restricted_code"
+                else _CaseVerifier(case)
+            )
+            fault_kind = None if condition in {"clean", "no_feedback"} else FaultKind(condition)
+            schedule: FaultSchedule | None = None
+            fault_verifiers: list[_FaultingVerifier] = []
+            if fault_kind is not None:
+                schedule = FaultSchedule.create(
+                    FaultScheduleKey(
+                        global_seed=active.seed,
+                        example_id=case.example_id,
+                        verifier_id=f"{verifier.verifier_type}@{verifier.verifier_version}",
+                        fault_condition=fault_kind.value,
+                    ),
+                    steps=active.max_iterations,
+                    probability=active.fault_probability,
                 )
-                baseline_name = BaselineName(baseline)
-                model = _ScriptedSmokeModel(case)
-                verifier = (
-                    RestrictedPythonVerifier(case.test_cases, function_name="solve")
-                    if case.domain == "restricted_code"
-                    else _CaseVerifier(case)
+                schedules.append(schedule)
+                fault_verifiers = _faulting_verifiers(
+                    verifier,
+                    FaultConfig(
+                        fault_kind,
+                        probability=active.fault_probability,
+                        seed=active.seed,
+                        delay_steps=active.fault_delay_steps,
+                    ),
+                    schedule,
                 )
-                fault_verifiers: list[_FaultingVerifier] = []
-                if fault_kind is not None:
-                    fault_verifiers = _faulting_verifiers(
-                        verifier,
-                        FaultConfig(
-                            fault_kind,
-                            probability=active.fault_probability,
-                            seed=row_seed,
-                            delay_steps=active.fault_delay_steps,
-                        ),
-                    )
-                verifiers: list[Any] = fault_verifiers or [verifier]
-                if baseline_name is BaselineName.DIRECT:
-                    result = run_direct(case.task, model, budget=budget)
-                elif baseline_name is BaselineName.SELF_REFINE:
-                    result = run_self_refine(
-                        case.task, model, budget=budget, max_iterations=active.max_iterations
-                    )
-                elif baseline_name is BaselineName.BEST_OF_N:
-                    result = run_best_of_n(case.task, model, budget=budget, n=active.max_iterations)
-                elif baseline_name is BaselineName.FIXED_EXTERNAL_LOOP:
-                    result = run_fixed_external_loop(
-                        case.task,
-                        model,
-                        verifiers,
-                        budget=budget,
-                        rounds=active.max_iterations,
-                    )
-                elif baseline_name is BaselineName.RANDOM_STOPPING:
-                    result = run_random_stopping(
-                        case.task,
-                        model,
-                        verifiers,
-                        budget=budget,
-                        max_iterations=active.max_iterations,
-                        seed=row_seed,
-                    )
-                elif baseline_name is BaselineName.VCER:
-                    result = run_vcer(
-                        case.task,
-                        model,
-                        verifiers,
-                        budget=budget,
-                        max_iterations=active.max_iterations,
-                    )
-                elif baseline_name is BaselineName.TOOL_AUGMENTED_INITIAL:
-                    initial_evidence = [
-                        active_verifier.verify(
-                            task=case.task,
-                            candidate=Candidate(case.initial_answer, model_id=model.model_id),
-                        )
-                        for active_verifier in verifiers
-                    ]
-                    result = run_tool_augmented_initial(
-                        case.task,
-                        model,
-                        initial_evidence=initial_evidence,
-                        budget=budget,
-                    )
-                else:
-                    result = run_oracle_upper_bound(
-                        case.task,
-                        model,
-                        verifiers,
-                        is_correct=partial(_candidate_is_correct, case),
-                        budget=budget,
-                        max_iterations=active.max_iterations,
-                    )
+            verifiers: list[Any] = (
+                []
+                if condition == "no_feedback"
+                else (fault_verifiers if fault_verifiers else [verifier])
+            )
+            trajectory = build_maximal_trajectory(
+                case.task,
+                _ScriptedSmokeModel(case),
+                verifiers,
+                budget=budget,
+                bandwidth=bandwidth,
+                initial=cached_initial,
+            )
+            for baseline in runnable:
+                result = replay_trajectory(baseline, trajectory, budget=budget)
                 rows.append(
                     _result_row(
                         case,
                         baseline,
                         result,
-                        seed=row_seed,
+                        seed=active.seed,
                         fault_kind=fault_kind,
                         fault_verifiers=fault_verifiers,
+                        fault_schedule=schedule,
+                        fault_condition=condition,
                     )
                 )
     rows.sort(key=lambda row: (row["baseline"], row["example_id"]))
@@ -703,15 +717,30 @@ def run_benchmark(
                     seed=active.seed,
                     resamples=active.bootstrap_resamples,
                 )
+    adjusted = holm_adjust(
+        {name: comparison["mcnemar_exact"]["p_value"] for name, comparison in comparisons.items()}
+    )
+    for name, value in adjusted.items():
+        comparisons[name]["mcnemar_exact"]["holm_adjusted_p_value"] = value
     result_data = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "kind": "smoke/demo",
+        "headline_status": "BLOCKED",
+        "headline_blockers": [
+            "VRR-Guard and VRR-Stop are contract baselines but are not faithfully implemented",
+            "no real-model pilot results are included",
+        ],
+        "unavailable_baselines": sorted({"vrr_guard", "vrr_stop", *unavailable}),
         "seed": active.seed,
         "config": asdict(active),
         "cases": [case.to_dict() for case in cases],
         "results": rows,
         "summaries": summaries,
         "paired_comparisons": comparisons,
+        "fault_schedule_manifest": {
+            "schedules": [schedule.to_dict() for schedule in schedules],
+            "manifest_hash": content_digest([schedule.to_dict() for schedule in schedules]),
+        },
     }
     if output_dir is not None:
         destination = Path(output_dir)
@@ -721,6 +750,11 @@ def run_benchmark(
         )
         (destination / "report.json").write_text(
             canonical_json(result_data), encoding="utf-8", newline="\n"
+        )
+        (destination / "fault_schedules.json").write_text(
+            canonical_json(result_data["fault_schedule_manifest"]),
+            encoding="utf-8",
+            newline="\n",
         )
     return result_data
 

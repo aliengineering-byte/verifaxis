@@ -12,7 +12,7 @@ from verifaxis.reporting import canonical_json
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("config", nargs="?", default="configs/smoke.yaml")
+    parser.add_argument("config", nargs="?", default="configs/smoke.json")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="verifaxis-smoke-") as directory:
         first = run_benchmark(args.config, Path(directory) / "first")

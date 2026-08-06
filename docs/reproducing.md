@@ -1,4 +1,4 @@
-# Reproducing v0.1
+# Reproducing the offline smoke demo
 
 ## Environment
 
@@ -14,7 +14,7 @@ python -m venv .venv
 .venv/bin/ruff format --check .
 .venv/bin/ruff check .
 .venv/bin/mypy src
-.venv/bin/pytest
+.venv/bin/pytest --cov=verifaxis --cov-report=term-missing --cov-fail-under=75
 .venv/bin/python -m build
 ```
 
@@ -22,19 +22,26 @@ On Windows, replace `.venv/bin/` with `.venv\Scripts\`.
 
 ## Installed-artifact verification
 
-Create two fresh environments. Install the wheel in one and the sdist in the other, then run:
+Create fresh wheel and sdist environments, run `verifaxis demo` in each, then:
 
 ```bash
-verifaxis demo
-verifaxis bench --config configs/smoke.yaml --output runs/first
-verifaxis bench --config configs/smoke.yaml --output runs/second
+verifaxis bench --config configs/smoke.json --output runs/first
+verifaxis bench --config configs/smoke.json --output runs/second
 python scripts/compare_runs.py runs/first runs/second
 ```
 
-The raw smoke rows normalize wall-clock measurements to zero and omit timestamp-dependent evidence hashes. Every persisted field—including candidates, evidence summaries, decisions, metrics, and seeds—must match exactly.
+Candidate sequences, schedule hashes, status transitions, replay usage, metrics,
+and seeds must match exactly. Measured wall/verifier runtime is honest and may
+differ; compare scripts may exclude only those declared timing fields.
+`fault_schedules.json` is evaluator-side and its manifest hash must verify before
+analysis.
 
 ## Research runs
 
-Do not run headline experiments under the smoke contract. First add a dated contract amendment containing dataset manifests and licenses, exact model and serving snapshots, decoding parameters, prompts, budgets, seeds, fault schedules, primary contrasts, statistical tests, and permitted claims.
+Do not run headline experiments under the smoke contract. First confirm the v0.2
+amendment with exact dataset manifests/licenses, model/serving/tokenizer
+snapshots, decoding parameters, prompts, budgets, seeds, schedules, primary
+contrasts, statistical tests, and permitted claims.
 
-Store raw JSON results before aggregate reports. Never overwrite a frozen run; use a new run ID and record the code commit.
+Store raw JSON before aggregate reports. Never overwrite a frozen run; use a new
+run ID and record the analysis commit.

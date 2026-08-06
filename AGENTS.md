@@ -4,7 +4,7 @@
 
 - `src/verifaxis/`: protocols, controllers, models, verifiers, faults, baselines, metrics, reporting, and CLI.
 - `tests/`: offline deterministic unit and integration tests.
-- `examples/`, `configs/`, `benchmarks/`: JSON-valid YAML inputs and immutable smoke fixtures.
+- `examples/`, `configs/`, `benchmarks/`: JSON inputs and immutable smoke fixtures.
 - `docs/`: architecture, audit, research contract, security, benchmark, and reproduction notes.
 - `paper/`: provisional outline, claim ledger, and primary references; not a submitted paper.
 
@@ -18,7 +18,7 @@ mypy src
 pytest
 python -m build
 verifaxis demo
-verifaxis bench --config configs/smoke.yaml
+verifaxis bench --config configs/smoke.json
 ```
 
 Tests and the quick start must not require a network, GPU, API key, or paid service.

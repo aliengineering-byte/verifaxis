@@ -34,15 +34,15 @@ def test_restricted_code_checker_never_needs_execution() -> None:
     assert not restricted_code_matches("a - b", "a + b")
 
 
-def test_load_json_valid_yaml(tmp_path: Path) -> None:
-    config_path = tmp_path / "smoke.yaml"
+def test_load_strict_json(tmp_path: Path) -> None:
+    config_path = tmp_path / "smoke.json"
     config_path.write_text(
         json.dumps({"seed": 3, "arithmetic_tasks": 1, "code_tasks": 0}),
         encoding="utf-8",
     )
     assert load_config(config_path).seed == 3
     config_path.write_text("seed: 3", encoding="utf-8")
-    with pytest.raises(ValueError, match="JSON is valid YAML"):
+    with pytest.raises(ValueError, match="strict JSON"):
         load_config(config_path)
 
 
@@ -59,12 +59,24 @@ def test_benchmark_keeps_raw_rows_seeds_and_is_reproducible(tmp_path: Path) -> N
     )
     first = run_benchmark(config, tmp_path / "first")
     second = run_benchmark(config, tmp_path / "second")
-    assert first == second
-    assert len(first["results"]) == 6
+    assert first["cases"] == second["cases"]
+    assert first["fault_schedule_manifest"] == second["fault_schedule_manifest"]
+    comparable_keys = (
+        "example_id",
+        "baseline",
+        "initial_answer",
+        "last_candidate",
+        "termination_reason",
+        "model_calls",
+        "verifier_calls",
+        "total_tokens",
+    )
+    assert [tuple(row[key] for key in comparable_keys) for row in first["results"]] == [
+        tuple(row[key] for key in comparable_keys) for row in second["results"]
+    ]
+    assert len(first["results"]) == 12
     assert all(isinstance(row["seed"], int) for row in first["results"])
-    assert (tmp_path / "first" / "raw_results.json").read_bytes() == (
-        tmp_path / "second" / "raw_results.json"
-    ).read_bytes()
+    assert (tmp_path / "first" / "fault_schedules.json").is_file()
 
 
 def test_code_smoke_fails_a_case_then_repairs_from_evidence() -> None:
@@ -106,12 +118,17 @@ def test_vcer_fault_smoke_records_fault_and_stops_safely(fault_kind: str) -> Non
             bootstrap_resamples=10,
         )
     )
-    row = result["results"][0]
+    row = next(row for row in result["results"] if row["fault_kind"] == fault_kind)
     assert row["fault_kind"] == fault_kind
     assert row["fault_applied"] is True
-    assert row["verified"] is False
-    assert row["safe_stopped"] is True
-    assert row["failure_amplified"] is False
+    serialized_evidence = json.dumps(row["evidence"])
+    assert "injected_fault" not in serialized_evidence
+    assert fault_kind not in serialized_evidence
+    if fault_kind == "false_positive":
+        assert row["verified"] is True
+        assert row["failure_amplified"] is True
+    else:
+        assert row["failure_amplified"] is False
 
 
 def test_every_fault_kind_is_configurable() -> None:
@@ -128,6 +145,28 @@ def test_every_fault_kind_is_configurable() -> None:
     )
     config = BenchmarkConfig.from_mapping({"arithmetic_tasks": 1, "code_tasks": 0, "faults": names})
     assert config.faults == names
+
+
+def test_initial_candidate_and_fault_schedule_are_identical_across_policies() -> None:
+    result = run_benchmark(
+        BenchmarkConfig(
+            seed=2718,
+            arithmetic_tasks=1,
+            code_tasks=0,
+            baselines=("fixed_external_loop", "accepted_first", "vcer"),
+            faults=("false_negative",),
+            max_iterations=3,
+            max_model_calls=3,
+            max_verifier_calls=3,
+            bootstrap_resamples=10,
+        )
+    )
+    fault_rows = [row for row in result["results"] if row["fault_kind"] == "false_negative"]
+    assert len({row["initial_answer"] for row in fault_rows}) == 1
+    assert len({row["fault_schedule_hash"] for row in fault_rows}) == 1
+    manifest = result["fault_schedule_manifest"]
+    assert len(manifest["schedules"]) == 1
+    assert "baseline" not in manifest["schedules"][0]["key"]
 
 
 def test_invalid_config() -> None:

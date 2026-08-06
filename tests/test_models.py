@@ -56,7 +56,22 @@ def test_openai_compatible_adapter_parses_text_and_usage() -> None:
     assert candidate == Candidate(
         "42",
         model_id="openai-compatible/local",
-        metadata={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        metadata={
+            "request_character_count": 302,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated": False,
+            },
+            "raw_provider_usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            },
+        },
     )
     request = urlopen.call_args.args[0]
     assert request.full_url == "http://localhost:1234/v1/chat/completions"

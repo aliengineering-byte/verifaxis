@@ -14,6 +14,7 @@ from .types import (
     LoopStep,
     RunTrace,
     TerminationReason,
+    Usage,
     VerificationResult,
 )
 
@@ -29,6 +30,7 @@ __all__ = [
     "ModelAdapter",
     "RunTrace",
     "TerminationReason",
+    "Usage",
     "VerificationController",
     "VerificationResult",
     "Verifier",

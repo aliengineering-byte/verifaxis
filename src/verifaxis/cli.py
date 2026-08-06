@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from .bench import load_config, run_benchmark
-from .models import ReplayModel
+from .models import OpenAICompatibleModel, ReplayModel
 from .reporting import canonical_json, load_run, write_report
 from .runtime import verify
+from .types import Budget
 from .verifiers import SafeMathVerifier
 
 
@@ -21,9 +23,7 @@ def _json_file(path: str | Path) -> dict[str, Any]:
     try:
         value = json.loads(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
-        raise ValueError(
-            f"{source} must be JSON (JSON is valid YAML); unsafe YAML features are unsupported"
-        ) from error
+        raise ValueError(f"{source} must be strict JSON; YAML syntax is unsupported") from error
     if not isinstance(value, dict):
         raise ValueError(f"{source} must contain an object")
     return value
@@ -39,16 +39,65 @@ def _name(value: Any, *, default: str) -> str:
 
 def _run_spec(path: str | Path) -> dict[str, Any]:
     spec = _json_file(path)
-    allowed = {"schema_version", "task", "model", "verifiers", "max_iterations"}
+    allowed = {
+        "schema_version",
+        "task",
+        "model",
+        "verifiers",
+        "max_iterations",
+        "max_model_calls",
+        "max_verifier_calls",
+        "max_total_tokens",
+        "max_wall_time_seconds",
+    }
     unknown = set(spec) - allowed
     if unknown:
         raise ValueError(f"unknown run fields: {', '.join(sorted(unknown))}")
     task = spec.get("task")
     if not isinstance(task, str) or not task.strip():
         raise ValueError("run config requires a non-empty task")
-    model_name = _name(spec.get("model"), default="replay").lower()
-    if model_name not in {"replay", "replaymodel"}:
-        raise ValueError(f"unsupported offline model: {model_name}")
+    raw_model = spec.get("model", "replay")
+    model_name = _name(raw_model, default="replay").lower()
+    model: Any
+    if model_name in {"replay", "replaymodel"}:
+        model = ReplayModel()
+    elif model_name in {"openai_compatible", "openai-compatible"}:
+        if not isinstance(raw_model, dict):
+            raise ValueError("openai_compatible model configuration must be an object")
+        model_allowed = {
+            "type",
+            "model",
+            "base_url",
+            "api_key_env",
+            "timeout_seconds",
+            "temperature",
+            "max_output_tokens",
+        }
+        model_unknown = set(raw_model) - model_allowed
+        if model_unknown:
+            raise ValueError(
+                "unknown openai_compatible fields: " + ", ".join(sorted(model_unknown))
+            )
+        provider_model = raw_model.get("model")
+        if not isinstance(provider_model, str) or not provider_model:
+            raise ValueError("openai_compatible requires a non-empty model")
+        api_key_env = raw_model.get("api_key_env")
+        if api_key_env is not None and not isinstance(api_key_env, str):
+            raise ValueError("api_key_env must be a string")
+        model = OpenAICompatibleModel(
+            model=provider_model,
+            base_url=str(raw_model.get("base_url", "http://localhost:11434/v1")),
+            api_key=os.environ.get(api_key_env) if api_key_env else None,
+            timeout_seconds=float(raw_model.get("timeout_seconds", 60.0)),
+            temperature=float(raw_model.get("temperature", 0.0)),
+            max_output_tokens=(
+                None
+                if raw_model.get("max_output_tokens") is None
+                else int(raw_model["max_output_tokens"])
+            ),
+        )
+    else:
+        raise ValueError(f"unsupported model type: {model_name}")
     raw_verifiers = spec.get("verifiers", ["safe_math"])
     if not isinstance(raw_verifiers, list) or not raw_verifiers:
         raise ValueError("verifiers must be a non-empty array")
@@ -56,11 +105,29 @@ def _run_spec(path: str | Path) -> dict[str, Any]:
     if any(name not in {"safe_math", "safemathverifier"} for name in verifier_names):
         raise ValueError("only the offline safe_math verifier is supported in run configs")
     max_iterations = int(spec.get("max_iterations", 4))
+    budget = Budget(
+        max_iterations=max_iterations,
+        max_model_calls=(
+            None if spec.get("max_model_calls") is None else int(spec["max_model_calls"])
+        ),
+        max_verifier_calls=(
+            None if spec.get("max_verifier_calls") is None else int(spec["max_verifier_calls"])
+        ),
+        max_total_tokens=(
+            None if spec.get("max_total_tokens") is None else int(spec["max_total_tokens"])
+        ),
+        max_wall_time_seconds=(
+            None
+            if spec.get("max_wall_time_seconds") is None
+            else float(spec["max_wall_time_seconds"])
+        ),
+    )
     result = verify(
         task,
-        ReplayModel(),
+        model,
         [SafeMathVerifier() for _ in verifier_names],
         max_iterations=max_iterations,
+        budget=budget,
     )
     return result.to_dict()
 
@@ -123,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("demo", help="run the deterministic arithmetic smoke demo")
 
-    run_parser = subparsers.add_parser("run", help="run a JSON-valid YAML task config")
+    run_parser = subparsers.add_parser("run", help="run a JSON task config")
     run_parser.add_argument("config", help="path to the run configuration")
     run_parser.add_argument("--output", help="optional JSON trace destination")
 

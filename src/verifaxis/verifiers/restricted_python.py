@@ -74,17 +74,56 @@ _SAFE_CALLS = {
 }
 _CODE_FENCE = re.compile(r"```(?:python)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
+_MAX_INTEGER_BITS = 4_096
+_MAX_STRING_LENGTH = 100_000
+_MAX_CONTAINER_LENGTH = 10_000
+_MAX_TOTAL_ITEMS = 20_000
+_MAX_NESTING_DEPTH = 64
+_MAX_ITERATIONS = 1_000
+_MAX_EXPONENT = 100
 
-def _json_value(value: object) -> JSONValue:
+
+def _json_value(
+    value: object,
+    *,
+    _depth: int = 0,
+    _remaining: list[int] | None = None,
+) -> JSONValue:
+    if _depth > _MAX_NESTING_DEPTH:
+        raise ValueError("JSON-like value exceeds the nesting limit")
+    if _remaining is None:
+        _remaining = [_MAX_TOTAL_ITEMS]
     if value is None or isinstance(value, str | int | float | bool):
+        if isinstance(value, int) and value.bit_length() > _MAX_INTEGER_BITS:
+            raise ValueError("integer exceeds the interpreter size limit")
+        if isinstance(value, str) and len(value) > _MAX_STRING_LENGTH:
+            raise ValueError("string exceeds the interpreter size limit")
         if isinstance(value, float) and not math.isfinite(value):
             return repr(value)
         return value
     if isinstance(value, tuple | list):
-        return [_json_value(item) for item in value]
+        if len(value) > _MAX_CONTAINER_LENGTH:
+            raise ValueError("container exceeds the interpreter size limit")
+        _remaining[0] -= len(value)
+        if _remaining[0] < 0:
+            raise ValueError("value graph exceeds the interpreter item limit")
+        return [_json_value(item, _depth=_depth + 1, _remaining=_remaining) for item in value]
     if isinstance(value, dict):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    return repr(value)[:200]
+        if len(value) > _MAX_CONTAINER_LENGTH:
+            raise ValueError("container exceeds the interpreter size limit")
+        _remaining[0] -= len(value)
+        if _remaining[0] < 0:
+            raise ValueError("value graph exceeds the interpreter item limit")
+        result: dict[str, JSONValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str | int | float | bool | None):
+                raise TypeError("mapping keys must be JSON-like primitives")
+            normalized_key = str(key)
+            if len(normalized_key) > _MAX_STRING_LENGTH:
+                raise ValueError("mapping key exceeds the interpreter size limit")
+            result[normalized_key] = _json_value(item, _depth=_depth + 1, _remaining=_remaining)
+        return result
+    raise TypeError(f"unsupported non-JSON value: {type(value).__name__}")
 
 
 class _Interpreter:
@@ -99,14 +138,82 @@ class _Interpreter:
             raise ValueError("interpreter step limit exceeded")
 
     @staticmethod
-    def _bounded(value: object) -> object:
-        if isinstance(value, int) and value.bit_length() > 4096:
+    def _bounded(
+        value: object,
+        *,
+        _depth: int = 0,
+        _remaining: list[int] | None = None,
+    ) -> object:
+        if _depth > _MAX_NESTING_DEPTH:
+            raise ValueError("value exceeds the interpreter nesting limit")
+        if _remaining is None:
+            _remaining = [_MAX_TOTAL_ITEMS]
+        if isinstance(value, int) and value.bit_length() > _MAX_INTEGER_BITS:
             raise ValueError("integer exceeds the interpreter size limit")
-        if isinstance(value, str) and len(value) > 100_000:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite float is not supported")
+        if isinstance(value, str) and len(value) > _MAX_STRING_LENGTH:
             raise ValueError("string exceeds the interpreter size limit")
-        if isinstance(value, list | tuple | dict) and len(value) > 10_000:
-            raise ValueError("container exceeds the interpreter size limit")
+        if isinstance(value, list | tuple | dict):
+            if len(value) > _MAX_CONTAINER_LENGTH:
+                raise ValueError("container exceeds the interpreter size limit")
+            _remaining[0] -= len(value)
+            if _remaining[0] < 0:
+                raise ValueError("value graph exceeds the interpreter item limit")
+            children = (
+                (child for item in value.items() for child in item)
+                if isinstance(value, dict)
+                else value
+            )
+            for child in children:
+                _Interpreter._bounded(child, _depth=_depth + 1, _remaining=_remaining)
+        elif not isinstance(value, range | slice | str | int | float | bool | None):
+            raise ValueError(f"unsupported runtime value: {type(value).__name__}")
         return value
+
+    def _apply_binary(self, operation_node: ast.operator, left: object, right: object) -> object:
+        """Apply every binary operation through one preflight/postflight boundary."""
+
+        self._bounded(left)
+        self._bounded(right)
+        if isinstance(operation_node, ast.Pow):
+            if not isinstance(right, int | float):
+                raise ValueError("exponent must be numeric")
+            if abs(right) > _MAX_EXPONENT:
+                raise ValueError("exponent exceeds safety limit")
+            if (
+                isinstance(left, int)
+                and isinstance(right, int)
+                and right >= 0
+                and abs(left) > 1
+                and left.bit_length() * right > _MAX_INTEGER_BITS
+            ):
+                raise ValueError("power result exceeds the integer size limit")
+        if isinstance(operation_node, ast.Mult):
+            sequence, multiplier = left, right
+            if isinstance(right, str | list | tuple) and isinstance(left, int):
+                sequence, multiplier = right, left
+            if isinstance(sequence, str | list | tuple) and isinstance(multiplier, int):
+                predicted = len(sequence) * max(multiplier, 0)
+                limit = _MAX_STRING_LENGTH if isinstance(sequence, str) else _MAX_CONTAINER_LENGTH
+                if predicted > limit:
+                    raise ValueError("sequence multiplication exceeds the size limit")
+            if isinstance(left, int) and isinstance(right, int) and left and right:
+                minimum_bits = left.bit_length() + right.bit_length() - 1
+                if minimum_bits > _MAX_INTEGER_BITS:
+                    raise ValueError("integer multiplication exceeds the size limit")
+        if (
+            isinstance(operation_node, ast.Add)
+            and isinstance(left, str | list | tuple)
+            and isinstance(right, type(left))
+        ):
+            limit = _MAX_STRING_LENGTH if isinstance(left, str) else _MAX_CONTAINER_LENGTH
+            if len(left) + len(right) > limit:
+                raise ValueError("sequence addition exceeds the size limit")
+        if isinstance(operation_node, ast.Mod) and isinstance(left, str):
+            raise ValueError("string formatting is not supported")
+        operation = _BINARY[type(operation_node)]
+        return self._bounded(operation(left, right))  # type: ignore[operator]
 
     def call(self, args: tuple[JSONValue, ...], kwargs: Mapping[str, JSONValue]) -> object:
         self.steps = 0
@@ -115,11 +222,13 @@ class _Interpreter:
             raise ValueError("variadic and keyword-only parameters are not supported")
         if len(args) + len(kwargs) != len(parameters):
             raise TypeError("test arguments do not match function parameters")
-        environment: dict[str, object] = dict(zip(parameters, args, strict=False))
+        environment: dict[str, object] = {
+            key: self._bounded(value) for key, value in zip(parameters, args, strict=False)
+        }
         for key, value in kwargs.items():
             if key not in parameters or key in environment:
                 raise TypeError("test arguments do not match function parameters")
-            environment[key] = value
+            environment[key] = self._bounded(value)
         if set(environment) != set(parameters):
             raise TypeError("test arguments do not match function parameters")
         try:
@@ -148,10 +257,9 @@ class _Interpreter:
             if not isinstance(node.target, ast.Name) or type(node.op) not in _BINARY:
                 raise ValueError("unsupported augmented assignment")
             current = self._name(node.target.id, environment)
-            operation = _BINARY[type(node.op)]
-            environment[node.target.id] = operation(
-                current, self._expression(node.value, environment)
-            )  # type: ignore[operator]
+            environment[node.target.id] = self._apply_binary(
+                node.op, current, self._expression(node.value, environment)
+            )
             return
         if isinstance(node, ast.If):
             branch = node.body if self._expression(node.test, environment) else node.orelse
@@ -161,7 +269,7 @@ class _Interpreter:
             values = self._expression(node.iter, environment)
             if not isinstance(values, range | list | tuple | str):
                 raise ValueError("for-loop iterable is not bounded")
-            if len(values) > 1_000:
+            if len(values) > _MAX_ITERATIONS:
                 raise ValueError("for-loop exceeds 1,000 iterations")
             for value in values:
                 self._assign(node.target, value, environment)
@@ -184,7 +292,7 @@ class _Interpreter:
 
     def _assign(self, target: ast.expr, value: object, environment: dict[str, object]) -> None:
         if isinstance(target, ast.Name) and not target.id.startswith("__"):
-            environment[target.id] = value
+            environment[target.id] = self._bounded(value)
             return
         if isinstance(target, ast.Tuple) and isinstance(value, tuple | list):
             if len(target.elts) != len(value):
@@ -209,45 +317,25 @@ class _Interpreter:
         if isinstance(node, ast.Name):
             return self._name(node.id, environment)
         if isinstance(node, ast.List):
-            return [self._expression(item, environment) for item in node.elts]
+            return self._bounded([self._expression(item, environment) for item in node.elts])
         if isinstance(node, ast.Tuple):
-            return tuple(self._expression(item, environment) for item in node.elts)
+            return self._bounded(tuple(self._expression(item, environment) for item in node.elts))
         if isinstance(node, ast.Dict):
             keys = [self._expression(key, environment) for key in node.keys if key is not None]
             values = [self._expression(item, environment) for item in node.values]
-            return dict(zip(keys, values, strict=True))
+            return self._bounded(dict(zip(keys, values, strict=True)))
         if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
-            operation = _BINARY[type(node.op)]
             left = self._expression(node.left, environment)
             right = self._expression(node.right, environment)
-            if isinstance(node.op, ast.Pow) and isinstance(right, int | float) and abs(right) > 100:
-                raise ValueError("exponent exceeds safety limit")
-            if isinstance(node.op, ast.Mult):
-                sequence, multiplier = (left, right)
-                if isinstance(right, str | list | tuple) and isinstance(left, int):
-                    sequence, multiplier = right, left
-                if (
-                    isinstance(sequence, str | list | tuple)
-                    and isinstance(multiplier, int)
-                    and (multiplier < 0 or len(sequence) * multiplier > 10_000)
-                ):
-                    raise ValueError("sequence multiplication exceeds the size limit")
-            if (
-                isinstance(node.op, ast.Add)
-                and isinstance(left, str | list | tuple)
-                and isinstance(right, type(left))
-                and len(left) + len(right) > 10_000
-            ):
-                raise ValueError("sequence addition exceeds the size limit")
-            return self._bounded(operation(left, right))  # type: ignore[operator]
+            return self._apply_binary(node.op, left, right)
         if isinstance(node, ast.UnaryOp):
             value = self._expression(node.operand, environment)
             if isinstance(node.op, ast.Not):
                 return not value
             if isinstance(node.op, ast.USub):
-                return -value  # type: ignore[operator]
+                return self._bounded(-value)  # type: ignore[operator]
             if isinstance(node.op, ast.UAdd):
-                return +value  # type: ignore[operator]
+                return self._bounded(+value)  # type: ignore[operator]
             raise ValueError("unsupported unary operator")
         if isinstance(node, ast.BoolOp):
             if isinstance(node.op, ast.And):
@@ -269,7 +357,7 @@ class _Interpreter:
         if isinstance(node, ast.Subscript):
             container = self._expression(node.value, environment)
             index = self._expression(node.slice, environment)
-            return container[index]  # type: ignore[index]
+            return self._bounded(container[index])  # type: ignore[index]
         if isinstance(node, ast.Slice):
             lower = None if node.lower is None else self._expression(node.lower, environment)
             upper = None if node.upper is None else self._expression(node.upper, environment)
@@ -288,7 +376,7 @@ class _Interpreter:
                 if not 1 <= len(int_args) <= 3:
                     raise ValueError("range requires one to three integer arguments")
                 value = range(*int_args)
-                if len(value) > 1_000:
+                if len(value) > _MAX_ITERATIONS:
                     raise ValueError("range exceeds 1,000 elements")
                 return value
             functions: dict[str, Callable[..., object]] = {
@@ -303,7 +391,18 @@ class _Interpreter:
                 "sum": sum,
                 "zip": lambda *values: list(zip(*values, strict=False)),
             }
-            return functions[node.func.id](*args)
+            if node.func.id in {"enumerate", "sorted"}:
+                if len(args) != 1 or not hasattr(args[0], "__len__"):
+                    raise ValueError(f"{node.func.id} requires one bounded iterable")
+                if len(args[0]) > _MAX_CONTAINER_LENGTH:
+                    raise ValueError(f"{node.func.id} output exceeds the size limit")
+            if node.func.id == "zip":
+                for value in args:
+                    if not hasattr(value, "__len__"):
+                        raise ValueError("zip requires bounded iterables")
+                if args and min(len(value) for value in args) > _MAX_CONTAINER_LENGTH:  # type: ignore[arg-type]
+                    raise ValueError("zip output exceeds the size limit")
+            return self._bounded(functions[node.func.id](*args))
         raise ValueError(f"unsupported expression: {type(node).__name__}")
 
 
@@ -437,6 +536,7 @@ class RestrictedPythonVerifier:
         for index, case in enumerate(self.test_cases):
             try:
                 observed = interpreter.call(case.args, case.kwargs)
+                observed_json = _json_value(observed)
             except Exception as error:
                 return self._packet(
                     EvidenceStatus.FAIL,
@@ -451,7 +551,6 @@ class RestrictedPythonVerifier:
                         "message": str(error)[:200],
                     },
                 )
-            observed_json = _json_value(observed)
             if observed_json != case.expected:
                 return self._packet(
                     EvidenceStatus.FAIL,

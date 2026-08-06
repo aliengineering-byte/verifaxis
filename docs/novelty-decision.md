@@ -38,5 +38,11 @@ Until cross-model, cross-domain, matched-budget experiments are complete, the pr
 
 ## Gate to stronger claims
 
-A stronger paper claim requires preregistered model snapshots and benchmark manifests, at least two deterministic domains, multiple model families, tool-parity baselines, matched compute, uncertainty intervals, paired tests, ablations, fault sweeps, and reported negative results. The finding must go beyond “tools help.”
+The current headline gate is **BLOCKED**. `VRR-Guard` and `VRR-Stop` are named
+comparison-contract baselines but are not faithfully implemented, and no exact
+real-model/dataset amendment has been confirmed. The 2026 preprints on robust
+noisy verify-repair stopping and matched misleading/no-feedback loops retire any
+broad stopping or unreliable-feedback novelty claim. See the draft v0.2
+research-contract amendment.
 
+A stronger paper claim requires preregistered model snapshots and benchmark manifests, at least two deterministic domains, multiple model families, tool-parity baselines, matched compute, uncertainty intervals, paired tests, ablations, fault sweeps, and reported negative results. The finding must go beyond “tools help.”
