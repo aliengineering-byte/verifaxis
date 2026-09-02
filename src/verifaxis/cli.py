@@ -9,10 +9,16 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .bench import load_config, run_benchmark
+from .evidence import (
+    load_and_validate_claim_evidence_artifact,
+    write_claim_evidence_artifact,
+)
 from .models import ReplayModel
 from .reporting import canonical_json, load_run, write_report
 from .runtime import verify
+from .types import VerificationResult
 from .verifiers import SafeMathVerifier
 
 
@@ -37,7 +43,7 @@ def _name(value: Any, *, default: str) -> str:
     return default
 
 
-def _run_spec(path: str | Path) -> dict[str, Any]:
+def _run_spec(path: str | Path) -> VerificationResult:
     spec = _json_file(path)
     allowed = {"schema_version", "task", "model", "verifiers", "max_iterations"}
     unknown = set(spec) - allowed
@@ -62,10 +68,10 @@ def _run_spec(path: str | Path) -> dict[str, Any]:
         [SafeMathVerifier() for _ in verifier_names],
         max_iterations=max_iterations,
     )
-    return result.to_dict()
+    return result
 
 
-def _demo() -> int:
+def _demo(args: argparse.Namespace) -> int:
     task = "What is 197 * 83?"
     result = verify(task, ReplayModel(), [SafeMathVerifier()], max_iterations=4)
     payload = {
@@ -78,13 +84,28 @@ def _demo() -> int:
         "model_calls": result.trace.model_calls,
         "verifier_calls": result.trace.verifier_calls,
     }
+    if args.evidence_output is not None:
+        evidence_path = write_claim_evidence_artifact(
+            result,
+            args.evidence_output,
+            producer_version=__version__,
+        )
+        payload["evidence_artifact"] = str(evidence_path)
     sys.stdout.write(canonical_json(payload))
     return 0 if result.verified else 1
 
 
 def _run(args: argparse.Namespace) -> int:
     result = _run_spec(args.config)
-    rendered = canonical_json(result)
+    payload = result.to_dict()
+    if args.evidence_output is not None:
+        evidence_path = write_claim_evidence_artifact(
+            result,
+            args.evidence_output,
+            producer_version=__version__,
+        )
+        payload["evidence_artifact"] = str(evidence_path)
+    rendered = canonical_json(payload)
     if args.output is None:
         sys.stdout.write(rendered)
     else:
@@ -92,6 +113,12 @@ def _run(args: argparse.Namespace) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(rendered, encoding="utf-8", newline="\n")
         sys.stdout.write(f"Wrote trace: {target}\n")
+    return 0
+
+
+def _verify_evidence(args: argparse.Namespace) -> int:
+    validation = load_and_validate_claim_evidence_artifact(args.artifact)
+    sys.stdout.write(canonical_json(validation))
     return 0
 
 
@@ -121,11 +148,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("demo", help="run the deterministic arithmetic smoke demo")
+    demo_parser = subparsers.add_parser("demo", help="run the deterministic arithmetic smoke demo")
+    demo_parser.add_argument(
+        "--evidence-output", help="optional complete claim/evidence artifact destination"
+    )
 
     run_parser = subparsers.add_parser("run", help="run a JSON-valid YAML task config")
     run_parser.add_argument("config", help="path to the run configuration")
     run_parser.add_argument("--output", help="optional JSON trace destination")
+    run_parser.add_argument(
+        "--evidence-output", help="optional complete claim/evidence artifact destination"
+    )
+
+    verify_evidence_parser = subparsers.add_parser(
+        "verify-evidence", help="validate a claim/evidence artifact offline"
+    )
+    verify_evidence_parser.add_argument("artifact", help="artifact JSON path")
 
     bench_parser = subparsers.add_parser("bench", help="run deterministic smoke benchmarks")
     bench_parser.add_argument("--config", required=True, help="benchmark configuration path")
@@ -145,13 +183,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
-            return _demo()
+            return _demo(args)
         if args.command == "run":
             return _run(args)
         if args.command == "bench":
             return _bench(args)
         if args.command == "report":
             return _report(args)
+        if args.command == "verify-evidence":
+            return _verify_evidence(args)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     parser.error(f"unknown command: {args.command}")

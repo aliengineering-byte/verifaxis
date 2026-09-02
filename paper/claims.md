@@ -6,6 +6,7 @@
 - Default arithmetic and restricted-function verifiers do not execute arbitrary candidate Python.
 - The controller exposes named success, budget, plateau, oscillation, conflict, unverifiable, model-error, and verifier-error outcomes.
 - The smoke harness can exercise named baselines and controlled fault types offline.
+- The CLI can export and independently validate a tamper-evident claim/evidence recurrence artifact.
 
 These are engineering claims, not model-quality findings.
 

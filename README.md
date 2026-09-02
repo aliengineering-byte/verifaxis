@@ -47,6 +47,26 @@ $ verifaxis demo
 
 This is `smoke/demo` output, not a benchmark result.
 
+Persist the complete claim, evidence chain, and named stopping decision, then validate it offline:
+
+```console
+$ verifaxis demo --evidence-output demo-evidence.json
+$ verifaxis verify-evidence demo-evidence.json
+{
+  "decision": "VERIFIED",
+  "evidence_packets": 2,
+  "status": "EVIDENCE ARTIFACT VERIFIED"
+}
+```
+
+The artifact contains the final explicit claim, both the failing and passing verifier packets,
+candidate and packet hashes, the full recurrence trace, `VERIFIED` stopping reason, package
+attribution, and limitations. Its outer hash detects accidental or unrecomputed changes; packet
+hashes and derived summaries are checked separately. This is self-consistency, not authentication:
+an editor can recompute the unsigned hash, and hash validity does not make a verifier correct or
+complete. The CLI accepts an identical existing artifact but refuses to overwrite different
+content.
+
 ## Architecture
 
 VerifAxis implements **Verifier-Conditioned External Recurrence (VCER)**:
@@ -66,7 +86,7 @@ flowchart LR
 
 The loop persists candidates, concise structured state, evidence hashes, residuals, budgets, and termination decisions. It neither requests nor stores private chain-of-thought. LLM-generated criticism is always marked as LLM-produced and never silently treated as independent evidence.
 
-The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
+The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. It rejects API keys and credential-like headers over plain HTTP unless the endpoint is explicitly loopback (`localhost` or a loopback IP), rejects credentials embedded in URLs, bounds and strictly parses responses, and does not include endpoint error details that may contain secrets. Open-weight latent recurrence is an interface-level future direction only; VerifAxis makes no claim that it works.
 
 ## What VerifAxis does not guarantee
 
@@ -82,10 +102,20 @@ See the [threat model](docs/threat-model.md) and [novelty decision](docs/novelty
 
 ```bash
 verifaxis demo
-verifaxis run examples/arithmetic.yaml
+verifaxis run examples/arithmetic.yaml --evidence-output claim-evidence.json
+verifaxis verify-evidence claim-evidence.json
 verifaxis bench --config configs/smoke.yaml
 verifaxis report runs/latest --format html
 ```
+
+Evidence output is complete by design: it contains the task, candidates, verifier packets,
+counterexamples, and timestamps. Choose a sanitized input or protect the destination as sensitive
+data. Output is no-clobber; because timestamps make a fresh run different, use a new filename (or
+deliberately remove the old local artifact) when repeating a demo. Validate only artifacts from
+trusted sources: `verify-evidence` treats files as untrusted strict UTF-8 JSON, rejects duplicate
+keys, and limits the document to 1 MiB, 32 JSON levels, 50,000 JSON nodes, and 1,024 evidence
+packets before deriving the claim, trace chain, and decision. These bounds mitigate local resource
+exhaustion; they do not authenticate an unsigned artifact.
 
 Run all offline checks:
 
@@ -113,6 +143,7 @@ class MyVerifier:
 ```
 
 Start with `src/verifaxis/verifiers/` and the security boundaries in [CONTRIBUTING.md](CONTRIBUTING.md).
+Report a sanitized defect with the [bug form](https://github.com/aliengineering-byte/verifaxis/issues/new?template=bug.yml), or discuss a verifier/research question with the [research form](https://github.com/aliengineering-byte/verifaxis/issues/new?template=research.yml). Never attach private prompts, credentials, or unredacted evidence.
 
 ## Research status
 
