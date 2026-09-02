@@ -9,6 +9,10 @@ from typing import cast
 from .types import JSONValue, VerificationResult, content_digest
 
 EVIDENCE_ARTIFACT_SCHEMA_VERSION = "1.0"
+MAX_EVIDENCE_BYTES = 1_048_576
+MAX_EVIDENCE_JSON_DEPTH = 32
+MAX_EVIDENCE_JSON_NODES = 50_000
+MAX_EVIDENCE_PACKETS = 1_024
 
 
 def _as_object(value: object, context: str) -> dict[str, JSONValue]:
@@ -21,6 +25,31 @@ def _as_array(value: object, context: str) -> list[JSONValue]:
     if not isinstance(value, list):
         raise ValueError(f"{context} must be a JSON array")
     return cast(list[JSONValue], value)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, JSONValue]]) -> dict[str, JSONValue]:
+    result: dict[str, JSONValue] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _enforce_json_limits(value: JSONValue) -> None:
+    stack: list[tuple[JSONValue, int]] = [(value, 1)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_EVIDENCE_JSON_NODES:
+            raise ValueError(f"evidence exceeds {MAX_EVIDENCE_JSON_NODES} JSON nodes")
+        if depth > MAX_EVIDENCE_JSON_DEPTH:
+            raise ValueError(f"evidence exceeds JSON depth {MAX_EVIDENCE_JSON_DEPTH}")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
 
 
 def _packet_summary(packet: dict[str, JSONValue]) -> dict[str, JSONValue]:
@@ -97,6 +126,7 @@ def validate_claim_evidence_artifact(value: object) -> dict[str, JSONValue]:
     """Validate the artifact hash, every packet hash, and derived decision summaries."""
 
     artifact = _as_object(value, "evidence artifact")
+    _enforce_json_limits(artifact)
     if artifact.get("schema_version") != EVIDENCE_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("unsupported evidence artifact schema_version")
     producer = _as_object(artifact.get("producer"), "producer")
@@ -125,6 +155,8 @@ def validate_claim_evidence_artifact(value: object) -> dict[str, JSONValue]:
         step = _as_object(raw_step, f"trace.steps[{index}]")
         candidate = _as_object(step.get("candidate"), f"trace.steps[{index}].candidate")
         raw_packets = _as_array(step.get("evidence"), f"trace.steps[{index}].evidence")
+        if packet_count + len(raw_packets) > MAX_EVIDENCE_PACKETS:
+            raise ValueError(f"evidence exceeds {MAX_EVIDENCE_PACKETS} packets")
         summaries: list[JSONValue] = []
         for packet_index, raw_packet in enumerate(raw_packets):
             packet = _as_object(
@@ -219,8 +251,13 @@ def load_and_validate_claim_evidence_artifact(path: str | Path) -> dict[str, JSO
     """Read and validate an artifact without executing a model or verifier."""
 
     source = Path(path)
+    if not source.is_file():
+        raise ValueError(f"evidence source must be a regular file: {source}")
+    if source.stat().st_size > MAX_EVIDENCE_BYTES:
+        raise ValueError(f"evidence exceeds {MAX_EVIDENCE_BYTES} bytes")
     try:
-        value: object = json.loads(source.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{source} is not valid JSON: {error}") from error
+        text = source.read_bytes().decode("utf-8")
+        value: object = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError(f"{source} is not strict UTF-8 JSON: {error}") from error
     return validate_claim_evidence_artifact(value)

@@ -86,7 +86,7 @@ flowchart LR
 
 The loop persists candidates, concise structured state, evidence hashes, residuals, budgets, and termination decisions. It neither requests nor stores private chain-of-thought. LLM-generated criticism is always marked as LLM-produced and never silently treated as independent evidence.
 
-The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. Use HTTPS whenever a remote endpoint receives an API key; plain HTTP can expose the Bearer credential in transit. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
+The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. It rejects API keys and credential-like headers over plain HTTP unless the endpoint is explicitly loopback (`localhost` or a loopback IP), rejects credentials embedded in URLs, bounds and strictly parses responses, and does not include endpoint error details that may contain secrets. Open-weight latent recurrence is an interface-level future direction only; VerifAxis makes no claim that it works.
 
 ## What VerifAxis does not guarantee
 
@@ -112,8 +112,10 @@ Evidence output is complete by design: it contains the task, candidates, verifie
 counterexamples, and timestamps. Choose a sanitized input or protect the destination as sensitive
 data. Output is no-clobber; because timestamps make a fresh run different, use a new filename (or
 deliberately remove the old local artifact) when repeating a demo. Validate only artifacts from
-trusted-sized inputs: `verify-evidence` checks structure and hashes but does not impose a file-size
-or nesting-depth limit.
+trusted sources: `verify-evidence` treats files as untrusted strict UTF-8 JSON, rejects duplicate
+keys, and limits the document to 1 MiB, 32 JSON levels, 50,000 JSON nodes, and 1,024 evidence
+packets before deriving the claim, trace chain, and decision. These bounds mitigate local resource
+exhaustion; they do not authenticate an unsigned artifact.
 
 Run all offline checks:
 
