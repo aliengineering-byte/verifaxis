@@ -86,7 +86,7 @@ flowchart LR
 
 The loop persists candidates, concise structured state, evidence hashes, residuals, budgets, and termination decisions. It neither requests nor stores private chain-of-thought. LLM-generated criticism is always marked as LLM-produced and never silently treated as independent evidence.
 
-The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
+The black-box adapter supports OpenAI-compatible HTTP endpoints, including compatible local servers. Use HTTPS whenever a remote endpoint receives an API key; plain HTTP can expose the Bearer credential in transit. Open-weight latent recurrence is an interface-level future direction only; v0.1 makes no claim that it works.
 
 ## What VerifAxis does not guarantee
 
@@ -107,6 +107,13 @@ verifaxis verify-evidence claim-evidence.json
 verifaxis bench --config configs/smoke.yaml
 verifaxis report runs/latest --format html
 ```
+
+Evidence output is complete by design: it contains the task, candidates, verifier packets,
+counterexamples, and timestamps. Choose a sanitized input or protect the destination as sensitive
+data. Output is no-clobber; because timestamps make a fresh run different, use a new filename (or
+deliberately remove the old local artifact) when repeating a demo. Validate only artifacts from
+trusted-sized inputs: `verify-evidence` checks structure and hashes but does not impose a file-size
+or nesting-depth limit.
 
 Run all offline checks:
 
@@ -134,6 +141,7 @@ class MyVerifier:
 ```
 
 Start with `src/verifaxis/verifiers/` and the security boundaries in [CONTRIBUTING.md](CONTRIBUTING.md).
+Report a sanitized defect with the [bug form](https://github.com/aliengineering-byte/verifaxis/issues/new?template=bug.yml), or discuss a verifier/research question with the [research form](https://github.com/aliengineering-byte/verifaxis/issues/new?template=research.yml). Never attach private prompts, credentials, or unredacted evidence.
 
 ## Research status
 

@@ -10,6 +10,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
   attribution, packet hashes, the full trace, and a named stopping decision.
 - `verify-evidence` validates the unsigned outer digest, every evidence-packet hash, and derived
   claim/decision summaries offline; conflicting artifact writes are refused.
+- Documented evidence sensitivity, repeat-output no-clobber behavior, unbounded-input validation,
+  and the HTTPS requirement for API keys sent to remote OpenAI-compatible endpoints.
 
 ## [0.1.0] - 2026-08-06
 
