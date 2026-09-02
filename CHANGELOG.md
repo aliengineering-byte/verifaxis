@@ -6,6 +6,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Added
 
+- The unreleased package identity is now `0.2.0` for the claim/evidence export contract.
 - `demo` and `run` can export a complete claim/evidence recurrence artifact with package
   attribution, packet hashes, the full trace, and a named stopping decision.
 - `verify-evidence` validates the unsigned outer digest, every evidence-packet hash, and derived

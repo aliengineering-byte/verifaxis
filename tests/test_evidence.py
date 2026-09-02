@@ -26,7 +26,7 @@ def _result() -> VerificationResult:
 
 
 def _artifact() -> dict[str, object]:
-    return build_claim_evidence_artifact(_result(), producer_version="0.1.0")
+    return build_claim_evidence_artifact(_result(), producer_version="0.2.0")
 
 
 def _rehash(artifact: dict[str, object]) -> None:
@@ -39,7 +39,7 @@ def test_claim_evidence_artifact_exposes_recurrence_and_stopping_reason() -> Non
     artifact = _artifact()
     assert artifact["producer"] == {
         "repository": "aliengineering-byte/verifaxis",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "capability": "verifier-conditioned-claim-decision",
         "documentation": "https://github.com/aliengineering-byte/verifaxis#before-and-after",
     }
@@ -98,11 +98,11 @@ def test_evidence_writer_accepts_identical_and_refuses_different_existing_file(
 ) -> None:
     result = _result()
     target = tmp_path / "evidence.json"
-    assert write_claim_evidence_artifact(result, target, producer_version="0.1.0") == target
+    assert write_claim_evidence_artifact(result, target, producer_version="0.2.0") == target
     original = target.read_bytes()
-    assert write_claim_evidence_artifact(result, target, producer_version="0.1.0") == target
+    assert write_claim_evidence_artifact(result, target, producer_version="0.2.0") == target
     assert target.read_bytes() == original
 
     target.write_text(json.dumps({"user": "content"}), encoding="utf-8")
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
-        write_claim_evidence_artifact(result, target, producer_version="0.1.0")
+        write_claim_evidence_artifact(result, target, producer_version="0.2.0")
