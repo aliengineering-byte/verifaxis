@@ -1,0 +1,271 @@
+name: Publish VerifAxis 0.2.0 to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: pypi-verifaxis-0.2.0
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v0.2.0
+  RELEASE_VERSION: 0.2.0
+  RELEASE_COMMIT: 24d6f27f7485de262282ec1b1384f84b3109a2af
+  WHEEL_SHA256: 3fe3e546372a8bf53a2467d67f3ed09382cb33de5566d74a6ffecaafc0fd7a9f
+  SDIST_SHA256: 2cee9f4eba2532dc5255c03ac10ed5b7d63d2b46892dbae75b079ea4de38a53c
+
+jobs:
+  verify:
+    name: Verify immutable release artifacts
+    if: >-
+      github.repository == 'aliengineering-byte/verifaxis' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the protected annotated tag and released source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main
+
+      - name: Download and checksum the exact GitHub release distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="verifaxis-$RELEASE_VERSION-py3-none-any.whl"
+          sdist="verifaxis-$RELEASE_VERSION.tar.gz"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          mkdir dist
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "dist/$wheel" "$base/$wheel"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "dist/$sdist" "$base/$sdist"
+          printf '%s  %s\n%s  %s\n' \
+            "$WHEEL_SHA256" "dist/$wheel" \
+            "$SDIST_SHA256" "dist/$sdist" | sha256sum --check --strict
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Inspect metadata, contents, and sensitive-path boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'twine==7.0.0'
+          python -m twine check dist/*
+          python - <<'PY'
+          import email
+          import hashlib
+          import re
+          import tarfile
+          import zipfile
+          from pathlib import PurePosixPath
+
+          version = "0.2.0"
+          wheel_path = f"dist/verifaxis-{version}-py3-none-any.whl"
+          sdist_path = f"dist/verifaxis-{version}.tar.gz"
+          blocked_parts = {
+              ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+              ".venv", "__pycache__", "node_modules",
+          }
+          blocked_suffixes = {".key", ".pem", ".p12", ".pfx", ".pyc"}
+          secret_patterns = [
+              re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+              re.compile(rb"(?:ghp_|github_pat_|npm_)[A-Za-z0-9_]{30,}"),
+              re.compile(rb"pypi-[A-Za-z0-9_-]{20,}"),
+              re.compile(rb"AKIA[0-9A-Z]{16}"),
+              re.compile(rb"sk-[A-Za-z0-9]{32,}"),
+          ]
+          local_patterns = [
+              re.compile(rb"/home/runner/"),
+              re.compile(rb"/Users/[^/\s]+/"),
+              re.compile(rb"[A-Za-z]:\\\\Users\\\\[^\\\s]+\\\\"),
+          ]
+
+          def safe_name(name: str) -> PurePosixPath:
+              assert "\\" not in name, name
+              path = PurePosixPath(name)
+              assert not path.is_absolute(), name
+              assert ".." not in path.parts, name
+              assert not blocked_parts.intersection(path.parts), name
+              assert path.suffix.lower() not in blocked_suffixes, name
+              return path
+
+          def scan_bytes(name: str, value: bytes) -> None:
+              assert len(value) <= 2_000_000, name
+              for pattern in (*secret_patterns, *local_patterns):
+                  assert pattern.search(value) is None, (name, pattern.pattern)
+
+          with zipfile.ZipFile(wheel_path) as archive:
+              infos = archive.infolist()
+              assert 1 <= len(infos) <= 200
+              assert sum(item.file_size for item in infos) <= 2_000_000
+              for item in infos:
+                  path = safe_name(item.filename)
+                  assert not ((item.external_attr >> 16) & 0o170000 == 0o120000), item.filename
+                  if not item.is_dir():
+                      scan_bytes(item.filename, archive.read(item))
+              metadata_names = [i.filename for i in infos if i.filename.endswith(".dist-info/METADATA")]
+              assert len(metadata_names) == 1, metadata_names
+              wheel_metadata = email.message_from_bytes(archive.read(metadata_names[0]))
+
+          with tarfile.open(sdist_path, "r:gz") as archive:
+              members = archive.getmembers()
+              assert 1 <= len(members) <= 500
+              assert sum(member.size for member in members) <= 5_000_000
+              roots = {safe_name(member.name).parts[0] for member in members}
+              assert roots == {f"verifaxis-{version}"}, roots
+              allowed = {
+                  ".github", "benchmarks", "configs", "docs", "examples", "paper",
+                  "scripts", "src", "tests",
+              }
+              for member in members:
+                  path = safe_name(member.name)
+                  assert not member.issym() and not member.islnk(), member.name
+                  relative = path.parts[1:]
+                  if len(relative) > 1:
+                      assert relative[0] in allowed, member.name
+                  if member.isfile():
+                      extracted = archive.extractfile(member)
+                      assert extracted is not None
+                      scan_bytes(member.name, extracted.read())
+              pkg_info = [m for m in members if m.isfile() and m.name == f"verifaxis-{version}/PKG-INFO"]
+              assert len(pkg_info) == 1
+              extracted = archive.extractfile(pkg_info[0])
+              assert extracted is not None
+              sdist_metadata = email.message_from_bytes(extracted.read())
+
+          for metadata in (wheel_metadata, sdist_metadata):
+              assert metadata["Name"] == "verifaxis"
+              assert metadata["Version"] == version
+              assert metadata["Requires-Python"] == ">=3.11"
+              assert metadata["License-Expression"] == "Apache-2.0"
+              urls = metadata.get_all("Project-URL", [])
+              assert "Repository, https://github.com/aliengineering-byte/verifaxis" in urls
+
+          assert hashlib.sha256(open(wheel_path, "rb").read()).hexdigest() == (
+              "3fe3e546372a8bf53a2467d67f3ed09382cb33de5566d74a6ffecaafc0fd7a9f"
+          )
+          assert hashlib.sha256(open(sdist_path, "rb").read()).hexdigest() == (
+              "2cee9f4eba2532dc5255c03ac10ed5b7d63d2b46892dbae75b079ea4de38a53c"
+          )
+          PY
+
+      - name: Install, demo, verify offline, and reject tampering before publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/verifaxis-release"
+          py="$RUNNER_TEMP/verifaxis-release/bin/python"
+          cli="$RUNNER_TEMP/verifaxis-release/bin/verifaxis"
+          "$py" -m pip install --disable-pip-version-check --no-index dist/*.whl
+          test "$("$py" -c 'import verifaxis; print(verifaxis.__version__)')" = "$RELEASE_VERSION"
+          "$cli" demo --evidence-output "$RUNNER_TEMP/demo-evidence.json"
+          "$cli" verify-evidence "$RUNNER_TEMP/demo-evidence.json"
+          python - "$RUNNER_TEMP/demo-evidence.json" "$RUNNER_TEMP/tampered-evidence.json" <<'PY'
+          import json
+          import sys
+          source, destination = sys.argv[1:]
+          value = json.load(open(source, encoding="utf-8"))
+          value["claim"]["candidate"] = "tampered"
+          with open(destination, "w", encoding="utf-8") as stream:
+              json.dump(value, stream)
+          PY
+          if "$cli" verify-evidence "$RUNNER_TEMP/tampered-evidence.json"; then
+            echo "Tampered evidence was accepted" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verifaxis-0.2.0-verified-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish through PyPI Trusted Publishing
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/verifaxis/0.2.0/
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verifaxis-0.2.0-verified-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
+
+  verify-public:
+    name: Verify the public PyPI consumer path
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - name: Query, install, execute, and tamper-test PyPI 0.2.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..18}; do
+            if curl --fail --silent --show-error \
+              "https://pypi.org/pypi/verifaxis/$RELEASE_VERSION/json" \
+              --output "$RUNNER_TEMP/pypi.json"; then
+              break
+            fi
+            sleep 10
+          done
+          python - "$RUNNER_TEMP/pypi.json" <<'PY'
+          import json
+          import sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert value["info"]["name"] == "verifaxis"
+          assert value["info"]["version"] == "0.2.0"
+          expected = {
+              "verifaxis-0.2.0-py3-none-any.whl": "3fe3e546372a8bf53a2467d67f3ed09382cb33de5566d74a6ffecaafc0fd7a9f",
+              "verifaxis-0.2.0.tar.gz": "2cee9f4eba2532dc5255c03ac10ed5b7d63d2b46892dbae75b079ea4de38a53c",
+          }
+          observed = {item["filename"]: item["digests"]["sha256"] for item in value["urls"]}
+          assert observed == expected, observed
+          PY
+          python -m venv "$RUNNER_TEMP/verifaxis-public"
+          py="$RUNNER_TEMP/verifaxis-public/bin/python"
+          cli="$RUNNER_TEMP/verifaxis-public/bin/verifaxis"
+          "$py" -m pip install --disable-pip-version-check --no-cache-dir \
+            --index-url https://pypi.org/simple "verifaxis==$RELEASE_VERSION"
+          "$cli" demo --evidence-output "$RUNNER_TEMP/public-evidence.json"
+          "$cli" verify-evidence "$RUNNER_TEMP/public-evidence.json"
+          python - "$RUNNER_TEMP/public-evidence.json" "$RUNNER_TEMP/public-tampered.json" <<'PY'
+          import json
+          import sys
+          source, destination = sys.argv[1:]
+          value = json.load(open(source, encoding="utf-8"))
+          value["decision"]["verified"] = not value["decision"]["verified"]
+          with open(destination, "w", encoding="utf-8") as stream:
+              json.dump(value, stream)
+          PY
+          if "$cli" verify-evidence "$RUNNER_TEMP/public-tampered.json"; then
+            echo "Tampered public evidence was accepted" >&2
+            exit 1
+          fi
