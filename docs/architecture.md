@@ -24,6 +24,7 @@ p_{z+1} = A_phi(p_z, h_z, Encode(e_z))
 | `EvidenceResidual` | Explicit unresolved/failed/conflicting constraints | Data, not free-form hidden reasoning |
 | `VerificationController` | Continue, verify, abstain, or stop on a named failure mode | Cannot promote LLM criticism to independent proof |
 | `RunTrace` | Persist steps, accounting, evidence, residuals, termination | JSON-safe and auditable |
+| Claim/evidence artifact | Bind an explicit final claim to the recurrence, packet hashes, and named stopping decision | Tamper evidence is not proof that the verifier is correct |
 
 Provider, verifier, controller, trace storage, and reporting boundaries remain separate so experiments can change one factor at a time.
 

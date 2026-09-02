@@ -4,6 +4,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+### Added
+
+- `demo` and `run` can export a complete claim/evidence recurrence artifact with package
+  attribution, packet hashes, the full trace, and a named stopping decision.
+- `verify-evidence` validates the unsigned outer digest, every evidence-packet hash, and derived
+  claim/decision summaries offline; conflicting artifact writes are refused.
+
 ## [0.1.0] - 2026-08-06
 
 ### Added

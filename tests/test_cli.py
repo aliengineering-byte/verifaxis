@@ -16,6 +16,31 @@ def test_demo_is_offline_and_reports_smoke(capsys: pytest.CaptureFixture[str]) -
     assert output["status"] == "VERIFIED"
 
 
+def test_demo_writes_and_validates_claim_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence_path = tmp_path / "demo-evidence.json"
+    assert main(["demo", "--evidence-output", str(evidence_path)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["evidence_artifact"] == str(evidence_path)
+    artifact = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert artifact["decision"]["stopping_reason"] == "VERIFIED"
+    assert [
+        packet["status"] for step in artifact["evidence_chain"] for packet in step["packets"]
+    ] == ["FAIL", "PASS"]
+
+    assert main(["verify-evidence", str(evidence_path)]) == 0
+    validation = json.loads(capsys.readouterr().out)
+    assert validation["status"] == "EVIDENCE ARTIFACT VERIFIED"
+    assert validation["evidence_packets"] == 2
+
+    artifact["claim"]["candidate"] = "tampered"
+    evidence_path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        main(["verify-evidence", str(evidence_path)])
+    assert error.value.code == 2
+
+
 def test_run_json_valid_yaml(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = tmp_path / "task.yaml"
     destination = tmp_path / "trace.json"

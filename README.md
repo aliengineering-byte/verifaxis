@@ -47,6 +47,26 @@ $ verifaxis demo
 
 This is `smoke/demo` output, not a benchmark result.
 
+Persist the complete claim, evidence chain, and named stopping decision, then validate it offline:
+
+```console
+$ verifaxis demo --evidence-output demo-evidence.json
+$ verifaxis verify-evidence demo-evidence.json
+{
+  "decision": "VERIFIED",
+  "evidence_packets": 2,
+  "status": "EVIDENCE ARTIFACT VERIFIED"
+}
+```
+
+The artifact contains the final explicit claim, both the failing and passing verifier packets,
+candidate and packet hashes, the full recurrence trace, `VERIFIED` stopping reason, package
+attribution, and limitations. Its outer hash detects accidental or unrecomputed changes; packet
+hashes and derived summaries are checked separately. This is self-consistency, not authentication:
+an editor can recompute the unsigned hash, and hash validity does not make a verifier correct or
+complete. The CLI accepts an identical existing artifact but refuses to overwrite different
+content.
+
 ## Architecture
 
 VerifAxis implements **Verifier-Conditioned External Recurrence (VCER)**:
@@ -82,7 +102,8 @@ See the [threat model](docs/threat-model.md) and [novelty decision](docs/novelty
 
 ```bash
 verifaxis demo
-verifaxis run examples/arithmetic.yaml
+verifaxis run examples/arithmetic.yaml --evidence-output claim-evidence.json
+verifaxis verify-evidence claim-evidence.json
 verifaxis bench --config configs/smoke.yaml
 verifaxis report runs/latest --format html
 ```
